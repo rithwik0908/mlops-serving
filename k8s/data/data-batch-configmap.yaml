@@ -1,0 +1,182 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-batch-code
+  namespace: ml-data
+  labels:
+    app: data-batch
+    role: data
+data:
+  requirements.txt: |
+    boto3==1.34.0
+    pandas==2.2.3
+    pyarrow==15.0.0
+  batch_pipeline.py: |
+    import os, json, boto3, pandas as pd
+    from datetime import datetime
+    from io import BytesIO
+    from botocore.client import Config
+
+    BUCKET     = os.getenv("MINIO_BUCKET",     "zulip-rewriter")
+    ENDPOINT   = os.getenv("MINIO_ENDPOINT",   "http://minio.ml-platform.svc.cluster.local:9000")
+    ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
+    SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
+    if not ACCESS_KEY or not SECRET_KEY:
+        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set (injected from minio-root Secret in K8s)")
+    VERSION    = os.getenv("DATA_VERSION",     "v1")
+    BATCH_DATE = os.getenv("BATCH_DATE",       datetime.utcnow().strftime("%Y-%m-%d"))
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=ACCESS_KEY,
+        aws_secret_access_key=SECRET_KEY,
+        verify=False,
+        config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+    )
+
+    print(f"Batch pipeline starting | version={VERSION} | date={BATCH_DATE}")
+
+    print("Step 1: Loading base corpus from MinIO...")
+    obj      = s3.get_object(Bucket=BUCKET, Key=f"raw/{VERSION}/full.parquet")
+    df_base  = pd.read_parquet(BytesIO(obj["Body"].read()))
+    print(f"  Base corpus: {len(df_base)} rows")
+
+    print("Step 2: Loading online production logs...")
+    paginator = s3.get_paginator("list_objects_v2")
+    log_rows  = []
+    for page in paginator.paginate(Bucket=BUCKET, Prefix="online_logs/"):
+        for obj_meta in page.get("Contents", []):
+            try:
+                obj  = s3.get_object(Bucket=BUCKET, Key=obj_meta["Key"])
+                logs = json.loads(obj["Body"].read())
+                for entry in logs:
+                    inp = entry.get("input", {})
+                    log_rows.append({
+                        "text":        inp.get("original_message", ""),
+                        "rewrite_style": inp.get("rewrite_style", ""),
+                        "sender_id":   inp.get("context", {}).get("sender_id", ""),
+                        "timestamp":   inp.get("timestamp", ""),
+                        "source":      "online_log",
+                        "binary_label": None,
+                        "synthetic":   False,
+                        "split":       "online",
+                    })
+            except Exception as e:
+                print(f"  Warning: {e}")
+
+    df_online = pd.DataFrame(log_rows) if log_rows else pd.DataFrame()
+    print(f"  Online logs: {len(df_online)} rows")
+
+    print("Step 2b: Loading user feedback labels from MinIO (feedback/ prefix)...")
+    TONE_TO_BINARY = {"formal": 1, "friendly": 1, "neutral": 0}
+    feedback_rows = []
+    for page in paginator.paginate(Bucket=BUCKET, Prefix="feedback/"):
+        for obj_meta in page.get("Contents", []):
+            if not obj_meta["Key"].endswith(".json"):
+                continue
+            try:
+                obj = s3.get_object(Bucket=BUCKET, Key=obj_meta["Key"])
+                rec = json.loads(obj["Body"].read())
+                action = rec.get("user_action", "")
+                if action not in ("thumbs_up", "thumbs_down", "selected", "edited"):
+                    continue
+                raw_tone = rec.get("correct_tone") or rec.get("tone_shown") or ""
+                binary = TONE_TO_BINARY.get(raw_tone.lower())
+                feedback_rows.append({
+                    "message_id":  rec.get("message_id"),
+                    "tone_label":  raw_tone.lower(),
+                    "binary_label": binary,
+                    "user_action": action,
+                    "preferred_text": rec.get("preferred_text"),
+                    "created_at":  rec.get("created_at"),
+                })
+            except Exception as e:
+                print(f"  Warning loading feedback {obj_meta['Key']}: {e}")
+
+    df_feedback = pd.DataFrame(feedback_rows) if feedback_rows else pd.DataFrame()
+    print(f"  Feedback entries: {len(df_feedback)} (thumbs_up/down/selected/edited)")
+
+    df_feedback_text = pd.DataFrame()
+    if not df_feedback.empty and "preferred_text" in df_feedback.columns:
+        has_text = df_feedback[df_feedback["preferred_text"].notna() & (df_feedback["preferred_text"] != "")]
+        if not has_text.empty:
+            df_feedback_text = has_text.rename(columns={"preferred_text": "text"})[
+                ["text", "binary_label", "tone_label", "user_action", "created_at"]
+            ].copy()
+            df_feedback_text["source"] = "feedback"
+            df_feedback_text["synthetic"] = False
+            df_feedback_text["split"] = "train"
+            print(f"  Feedback rows with preferred_text (usable for training): {len(df_feedback_text)}")
+
+    feedback_manifest = {
+        "batch_date": BATCH_DATE,
+        "feedback_total_entries": len(df_feedback),
+        "feedback_usable_for_training": len(df_feedback_text),
+        "thumbs_up": int((df_feedback["user_action"] == "thumbs_up").sum()) if not df_feedback.empty else 0,
+        "thumbs_down": int((df_feedback["user_action"] == "thumbs_down").sum()) if not df_feedback.empty else 0,
+        "approval_rate": round(
+            (df_feedback["user_action"].isin(["thumbs_up", "selected"])).sum() / max(len(df_feedback), 1),
+            4,
+        ) if not df_feedback.empty else None,
+    }
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"batch/{BATCH_DATE}/feedback_manifest.json",
+        Body=json.dumps(feedback_manifest, indent=2),
+    )
+    print(f"  Feedback manifest: {json.dumps(feedback_manifest)}")
+
+    print("Step 3: Candidate selection (no leakage)...")
+    df_train = df_base[
+        (df_base["text"].str.split().str.len() >= 5) &
+        (df_base["binary_label"].notna()) &
+        (~df_base["text"].duplicated()) &
+        (df_base["split"] == "train")
+    ].copy()
+
+    df_test = df_base[
+        (df_base["text"].str.split().str.len() >= 5) &
+        (df_base["binary_label"].notna()) &
+        (df_base["split"] == "test")
+    ].copy()
+
+    if not df_online.empty:
+        df_train = pd.concat([df_train, df_online], ignore_index=True)
+
+    if not df_feedback_text.empty:
+        df_train = pd.concat([df_train, df_feedback_text], ignore_index=True)
+        print(f"  Added {len(df_feedback_text)} feedback rows to train set")
+
+    print(f"  Train: {len(df_train)} | Test: {len(df_test)}")
+
+    print("Step 4: Uploading versioned datasets...")
+    batch_ver = f"{VERSION}_batch_{BATCH_DATE}"
+
+    def upload(df, name):
+        buf = BytesIO()
+        df.to_parquet(buf, index=False)
+        key = f"batch/{batch_ver}/{name}.parquet"
+        s3.put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue())
+        print(f"  Uploaded {key} ({len(df)} rows)")
+
+    upload(df_train, "train")
+    upload(df_test,  "test")
+
+    manifest = {
+        "batch_version":        batch_ver,
+        "created_at":           datetime.utcnow().isoformat(),
+        "train_rows":           len(df_train),
+        "test_rows":            len(df_test),
+        "online_log_rows":      len(df_online),
+        "feedback_rows_merged": len(df_feedback_text),
+        "feedback_approval_rate": feedback_manifest.get("approval_rate"),
+        "leakage_policy":       "test set fixed from original corpus; online logs and feedback training-only",
+        "filters":              {"min_words": 5, "require_label": True, "deduplicated": True},
+    }
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"batch/{batch_ver}/manifest.json",
+                  Body=json.dumps(manifest, indent=2))
+    print("Batch pipeline complete!")
+    print(json.dumps(manifest, indent=2))

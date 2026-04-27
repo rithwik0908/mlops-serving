@@ -1,0 +1,69 @@
+---
+- name: Deploy automated backups to Chameleon object storage
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
+    repo_root: "/opt/mlops_project"
+    objectstore_endpoint: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_ENDPOINT') | default('https://chi.tacc.chameleoncloud.org:7480', true) }}"
+    objectstore_bucket: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_BUCKET') | default('', true) }}"
+    objectstore_prefix: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_PREFIX') | default('proj15-backups', true) }}"
+    objectstore_access_key: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_ACCESS_KEY') | default('', true) }}"
+    objectstore_secret_key: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_SECRET_KEY') | default('', true) }}"
+    objectstore_region: "{{ lookup('env', 'CHAMELEON_OBJECTSTORE_REGION') | default('us-east-1', true) }}"
+    backup_namespaces:
+      - zulip
+      - ml-platform
+      - monitoring
+    backup_kustomize_dirs:
+      - "k8s/platform/backups/zulip/"
+      - "k8s/platform/backups/ml-platform/"
+      - "k8s/platform/backups/monitoring/"
+  tasks:
+    - name: Fail if required object storage inputs are missing
+      ansible.builtin.fail:
+        msg: >-
+          Set CHAMELEON_OBJECTSTORE_BUCKET, CHAMELEON_OBJECTSTORE_ACCESS_KEY,
+          and CHAMELEON_OBJECTSTORE_SECRET_KEY in the local shell before running deploy_backups.yml.
+      when:
+        - objectstore_bucket | length == 0 or objectstore_access_key | length == 0 or objectstore_secret_key | length == 0
+
+    - name: Ensure repo root directory exists
+      ansible.builtin.file:
+        path: "{{ repo_root }}"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copy backup manifests to VM
+      ansible.builtin.copy:
+        src: "../../../k8s/platform/backups/"
+        dest: "{{ repo_root }}/k8s/platform/backups/"
+        mode: "0644"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Ensure object storage backup secret exists in backup namespaces
+      ansible.builtin.shell: |
+        set -e
+        kubectl --kubeconfig {{ kubeconfig_path }} create secret generic chameleon-objectstore-backup -n {{ item }} \
+          --from-literal=endpoint={{ objectstore_endpoint }} \
+          --from-literal=bucket={{ objectstore_bucket }} \
+          --from-literal=prefix={{ objectstore_prefix }} \
+          --from-literal=access-key={{ objectstore_access_key }} \
+          --from-literal=secret-key={{ objectstore_secret_key }} \
+          --from-literal=region={{ objectstore_region }} \
+          --dry-run=client -o yaml | \
+        kubectl --kubeconfig {{ kubeconfig_path }} apply -f -
+      args:
+        executable: /bin/bash
+      loop: "{{ backup_namespaces }}"
+      no_log: true
+
+    - name: Apply backup automation bundles
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        apply -k {{ repo_root }}/{{ item }}
+      loop: "{{ backup_kustomize_dirs }}"

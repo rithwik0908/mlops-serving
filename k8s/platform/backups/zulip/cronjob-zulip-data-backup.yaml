@@ -1,0 +1,95 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zulip-data-backup
+  namespace: zulip
+  labels:
+    app: backup
+    component: zulip-data
+spec:
+  schedule: "45 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: backup
+            component: zulip-data
+        spec:
+          nodeSelector:
+            mlops.storage: block
+          restartPolicy: Never
+          volumes:
+            - name: zulip-data
+              persistentVolumeClaim:
+                claimName: zulip-proj15-data
+            - name: backup-scripts
+              configMap:
+                name: backup-scripts
+                defaultMode: 0555
+          containers:
+            - name: zulip-data-backup
+              image: python:3.12-alpine
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  apk add --no-cache tar gzip >/dev/null
+                  python -m pip install --no-cache-dir boto3 >/dev/null
+                  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                  OUT="/tmp/zulip-data-${TS}.tar.gz"
+                  tar -C /data -czf "${OUT}" .
+                  python /scripts/upload_file.py "${OUT}" "zulip/data/${TS}.tar.gz"
+              env:
+                - name: OBJECTSTORE_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: endpoint
+                - name: OBJECTSTORE_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: bucket
+                - name: OBJECTSTORE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: prefix
+                - name: OBJECTSTORE_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: access-key
+                - name: OBJECTSTORE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: secret-key
+                - name: OBJECTSTORE_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: region
+              volumeMounts:
+                - name: zulip-data
+                  mountPath: /data
+                  readOnly: true
+                - name: backup-scripts
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: 256Mi
+                limits:
+                  cpu: "500m"
+                  memory: 512Mi

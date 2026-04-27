@@ -1,0 +1,96 @@
+---
+# Prepare a Chameleon block volume mounted on the control-plane and make k3s use it
+# for local-path claims scheduled there. This is non-destructive: it updates future
+# provisioning behavior but does not delete or migrate already-bound PVCs.
+- name: Prepare control-plane block storage for k3s local-path workloads
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
+    block_device_partition: "/dev/vdb1"
+    block_mount_path: "/mnt/block"
+    block_local_path_dir: "/mnt/block/local-path-provisioner"
+    block_node_label_key: "mlops.storage"
+    block_node_label_value: "block"
+    block_storage_dirs:
+      - "/mnt/block/local-path-provisioner"
+      - "/mnt/block/zulip"
+      - "/mnt/block/postgres"
+      - "/mnt/block/mlflow"
+      - "/mnt/block/minio"
+      - "/mnt/block/prometheus"
+      - "/mnt/block/grafana"
+      - "/mnt/block/backups"
+  tasks:
+    - name: Wait for control-plane SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
+    - name: Read block volume UUID
+      ansible.builtin.command: "blkid -s UUID -o value {{ block_device_partition }}"
+      register: block_uuid
+      changed_when: false
+
+    - name: Ensure block mount path exists
+      ansible.builtin.file:
+        path: "{{ block_mount_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Persist block mount in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^UUID={{ block_uuid.stdout }}\\s+{{ block_mount_path }}\\s+ext4\\s+"
+        line: "UUID={{ block_uuid.stdout }} {{ block_mount_path }} ext4 defaults,nofail 0 2"
+        state: present
+
+    - name: Check whether the block mount is already active
+      ansible.builtin.command: "findmnt -n {{ block_mount_path }}"
+      register: block_mount_status
+      changed_when: false
+      failed_when: false
+
+    - name: Mount block volume if needed
+      ansible.builtin.command: "mount {{ block_mount_path }}"
+      when: block_mount_status.rc != 0
+
+    - name: Ensure block-backed service directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      loop: "{{ block_storage_dirs }}"
+
+    - name: Read control-plane node name from the host
+      ansible.builtin.command: hostname
+      register: control_plane_node_name
+      changed_when: false
+
+    - name: Label the control-plane as the block-backed storage node
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        label node {{ control_plane_node_name.stdout }}
+        {{ block_node_label_key }}={{ block_node_label_value }} --overwrite
+
+    - name: Point local-path provisioner at the block mount for control-plane claims
+      ansible.builtin.shell: |
+        set -euo pipefail
+        PATCH='{"data":{"config.json":"{\"nodePathMap\":[{\"node\":\"{{ control_plane_node_name.stdout }}\",\"paths\":[\"{{ block_local_path_dir }}\"]},{\"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\",\"paths\":[\"/var/lib/rancher/k3s/storage\"]}]}"}}'
+        kubectl --kubeconfig {{ kubeconfig_path }} patch configmap local-path-config -n kube-system --type merge -p "$PATCH"
+      args:
+        executable: /bin/bash
+
+    - name: Restart the local-path provisioner
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        rollout restart deployment/local-path-provisioner -n kube-system
+
+    - name: Wait for the local-path provisioner rollout
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        rollout status deployment/local-path-provisioner -n kube-system --timeout=120s
+      changed_when: false

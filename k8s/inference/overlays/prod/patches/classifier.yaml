@@ -17,12 +17,12 @@ spec:
               value: "production"
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
-            initialDelaySeconds: 90
-            periodSeconds: 10
+            initialDelaySeconds: 5
+            periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 36
+            failureThreshold: 120
           livenessProbe:
             httpGet:
               path: /health

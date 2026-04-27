@@ -32,6 +32,13 @@ spec:
           image: ghcr.io/allusudharshanrao/mlops-serving-classifier:latest
           # Always: after CI pushes a new :latest (e.g. torch added), nodes must not reuse an old cached tag.
           imagePullPolicy: Always
+          command:
+            - sh
+            - -c
+          args:
+            - |
+              python -c "import boto3" >/dev/null 2>&1 || python -m pip install --no-cache-dir boto3
+              exec uvicorn app:app --host 0.0.0.0 --port 8001 --workers 1
           ports:
             - containerPort: 8001
               name: http
@@ -61,18 +68,22 @@ spec:
               value: "us-east-1"
             - name: AWS_S3_FORCE_PATH_STYLE
               value: "true"
+          # /ready = 503 until model thread finishes (see serving/classifier app.py).
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
           livenessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # Staging (DUMMY_MODE) is light; prod/canary load PyTorch+MLflow models — keep >=2Gi limit.
             requests:

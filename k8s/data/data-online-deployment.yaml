@@ -20,8 +20,6 @@ spec:
         app: data-online
         role: data
     spec:
-      imagePullSecrets:
-        - name: ghcr-pull
       containers:
         - name: online
           image: ghcr.io/allusudharshanrao/mlops-data-online:latest

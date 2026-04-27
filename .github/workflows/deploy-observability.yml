@@ -1,7 +1,10 @@
 # Auto-apply Prometheus + Grafana manifests whenever observability config changes on main.
 # Also triggered manually (workflow_dispatch) so DevOps can re-apply after infra changes.
-# Requires repository secret KUBE_CONFIG_B64 (base64 of a kubeconfig with rights to
-# the monitoring namespace — same secret used by promote-inference.yml).
+# Requires repository secret KUBE_CONFIG_B64 with a kubeconfig that has rights to
+# the monitoring namespace. The secret may contain:
+#   - the raw kubeconfig YAML
+#   - a base64-encoded kubeconfig
+#   - a single-line kubeconfig string with escaped newlines
 #
 # What this automates:
 #   1. kubectl apply -k k8s/platform/observability/  — picks up Prometheus config,
@@ -29,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -39,18 +44,131 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${KUBE_CONFIG_B64:-}" ]; then
-            echo "::error::Missing repository secret KUBE_CONFIG_B64 (base64-encoded kubeconfig with access to the monitoring namespace)."
+            echo "::error::Missing repository secret KUBE_CONFIG_B64 (raw kubeconfig, escaped kubeconfig string, or base64-encoded kubeconfig with access to the monitoring namespace)."
             exit 1
           fi
-          echo "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+
+          python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          raw = os.environ["KUBE_CONFIG_B64"]
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "kubeconfig"
+
+          def looks_like_kubeconfig(text: str) -> bool:
+              markers = (
+                  "apiVersion:",
+                  "kind: Config",
+                  "clusters:",
+                  "users:",
+                  "contexts:",
+                  "current-context:",
+              )
+              stripped = text.lstrip()
+              return any(marker in stripped for marker in markers)
+
+          candidates: list[str] = [raw]
+
+          stripped_quotes = raw.strip().strip("'").strip('"')
+          if stripped_quotes != raw:
+              candidates.append(stripped_quotes)
+
+          escaped = stripped_quotes.replace("\\r\\n", "\n").replace("\\n", "\n")
+          if escaped != stripped_quotes:
+              candidates.append(escaped)
+
+          compact = "".join(raw.split())
+          if compact:
+              try:
+                  decoded = base64.b64decode(compact, validate=True).decode("utf-8")
+                  candidates.append(decoded)
+              except Exception:
+                  pass
+
+          for candidate in candidates:
+              if looks_like_kubeconfig(candidate):
+                  out.write_text(candidate.rstrip() + "\n", encoding="utf-8")
+                  sys.exit(0)
+
+          print(
+              "::error::KUBE_CONFIG_B64 is not valid base64 and does not look like raw or escaped kubeconfig YAML.",
+              file=sys.stderr,
+          )
+          sys.exit(1)
+          PY
+
           chmod 600 "$RUNNER_TEMP/kubeconfig"
+
+      - name: Tunnel Kubernetes API over SSH
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          CONTROL_PLANE_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          CONTROL_PLANE_USER: ${{ vars.CONTROL_PLANE_USER }}
+          CONTROL_PLANE_SSH_KEY: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTROL_PLANE_HOST:-}" ] || [ -z "${CONTROL_PLANE_USER:-}" ]; then
+            echo "::error::Missing Actions variables CONTROL_PLANE_HOST and/or CONTROL_PLANE_USER."
+            exit 1
+          fi
+          if [ -z "${CONTROL_PLANE_SSH_KEY:-}" ]; then
+            echo "::error::Missing repository secret CONTROL_PLANE_SSH_KEY."
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CONTROL_PLANE_SSH_KEY" > ~/.ssh/control_plane_key
+          chmod 600 ~/.ssh/control_plane_key
+          ssh-keyscan -H "$CONTROL_PLANE_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/control_plane_key \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -N -f \
+            -L 6443:127.0.0.1:6443 \
+            "${CONTROL_PLANE_USER}@${CONTROL_PLANE_HOST}"
+
+          CLUSTER_NAME="$(kubectl config view --kubeconfig "$KUBECONFIG" -o jsonpath='{.clusters[0].name}')"
+          kubectl config set-cluster "$CLUSTER_NAME" \
+            --server=https://127.0.0.1:6443 \
+            --kubeconfig "$KUBECONFIG" >/dev/null
+
+      - name: Verify cluster API reachability
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          if ! kubectl --request-timeout=15s cluster-info; then
+            echo "::error::GitHub runner cannot reach the Kubernetes API server. Verify that ${KUBECONFIG} points to a publicly reachable control-plane endpoint or run this deploy from a network that can reach the private cluster."
+            exit 1
+          fi
+
+      - name: Render public nip.io hostnames
+        env:
+          CONTROL_PLANE_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          PUBLIC_NIP_BASE: ${{ vars.PUBLIC_NIP_BASE }}
+        run: |
+          set -euo pipefail
+          PUBLIC_BASE="${PUBLIC_NIP_BASE:-${CONTROL_PLANE_HOST}.nip.io}"
+          if [ -z "${PUBLIC_BASE:-}" ] || [ "$PUBLIC_BASE" = ".nip.io" ]; then
+            echo "::error::Unable to determine PUBLIC_NIP_BASE. Set Actions variable PUBLIC_NIP_BASE or CONTROL_PLANE_HOST."
+            exit 1
+          fi
+
+          python3 k8s/scripts/render_public_endpoints.py --base "$PUBLIC_BASE"
 
       - name: Apply observability manifests
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           set -euo pipefail
-          kubectl apply -k k8s/platform/observability/
+          # Skip client-side OpenAPI validation in CI because runners can time out
+          # fetching /openapi/v2 even when the API server is otherwise reachable.
+          kubectl --request-timeout=30s apply --validate=false -k k8s/platform/observability/
           echo "Manifests applied."
 
       - name: Restart Grafana to pick up ConfigMap changes
@@ -58,8 +176,8 @@ jobs:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           set -euo pipefail
-          kubectl rollout restart deployment/grafana -n monitoring
-          kubectl rollout status deployment/grafana -n monitoring --timeout=180s
+          kubectl --request-timeout=30s rollout restart deployment/grafana -n monitoring
+          kubectl --request-timeout=30s rollout status deployment/grafana -n monitoring --timeout=180s
           echo "Grafana rollout healthy."
 
       - name: Restart Prometheus to reload config and rules
@@ -67,6 +185,6 @@ jobs:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           set -euo pipefail
-          kubectl rollout restart deployment/prometheus -n monitoring
-          kubectl rollout status deployment/prometheus -n monitoring --timeout=180s
+          kubectl --request-timeout=30s rollout restart deployment/prometheus -n monitoring
+          kubectl --request-timeout=30s rollout status deployment/prometheus -n monitoring --timeout=180s
           echo "Prometheus rollout healthy."

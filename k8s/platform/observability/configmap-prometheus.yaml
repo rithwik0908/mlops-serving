@@ -55,6 +55,19 @@ data:
 
   serving.rules.yml: |
     groups:
+      - name: platform_watchdog
+        interval: 30s
+        rules:
+          - alert: Watchdog
+            expr: vector(1)
+            for: 1m
+            labels:
+              severity: none
+              component: platform
+            annotations:
+              summary: "Watchdog"
+              description: "Synthetic always-firing alert to verify the alert pipeline."
+
       - name: serving_tone_services
         interval: 30s
         rules:
@@ -112,9 +125,102 @@ data:
               summary: "Generator p95 latency > 800ms (15m)"
               description: "Dummy CPU baseline may exceed SLO; GPU path or rollback."
 
+          - alert: ServingGeneratorFallbackRatioHigh
+            expr: |
+              sum(rate(generator_variant_source_total{source="fallback"}[15m]))
+              / clamp_min(sum(rate(generator_variant_source_total[15m])), 0.001)
+              > 0.25
+            for: 15m
+            labels:
+              severity: warning
+              component: serving
+            annotations:
+              summary: "Generator fallback ratio > 25% (15m)"
+              description: "UX quality is relying too heavily on rescue logic; inspect the promoted generator artifact before further rollout."
+
+          - alert: ServingGeneratorFeedbackApprovalLow
+            expr: |
+              (
+                clamp_min(sum(increase(bridge_feedback_total{user_action=~"thumbs_up|selected"}[24h])) or vector(0), 0)
+                /
+                clamp_min(sum(increase(bridge_feedback_total[24h])) or vector(0), 1)
+              ) < 0.65
+              and sum(increase(bridge_feedback_total[24h])) > 20
+            for: 30m
+            labels:
+              severity: warning
+              component: serving
+            annotations:
+              summary: "Generator feedback approval < 65% (24h)"
+              description: "Promotion confidence is low; compare canary and prod quality before advancing or consider rollback."
+
+          - alert: ServingGeneratorQueueWaitP95High
+            expr: |
+              histogram_quantile(
+                0.95,
+                sum(rate(generator_queue_wait_seconds_bucket[5m])) by (le)
+              ) > 0.15
+            for: 10m
+            labels:
+              severity: warning
+              component: serving
+            annotations:
+              summary: "Generator queue wait p95 > 150ms (10m)"
+              description: "The generator is becoming the bottleneck under load; scale or throttle before user-facing latency deteriorates."
+
       - name: platform_observability
         interval: 30s
         rules:
+          - alert: PlatformNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 2m
+            labels:
+              severity: critical
+              component: platform
+            annotations:
+              summary: "Kubernetes node is not ready"
+              description: "At least one cluster node has been non-ready for more than 2 minutes."
+
+          - alert: PlatformDeploymentUnavailableReplicas
+            expr: sum(kube_deployment_status_replicas_unavailable{namespace=~"ml-platform|monitoring|zulip|ml-serving"}) > 0
+            for: 2m
+            labels:
+              severity: warning
+              component: platform
+            annotations:
+              summary: "Unavailable replicas detected"
+              description: "One or more tracked deployments have unavailable replicas."
+
+          - alert: PlatformPodRestartsHigh
+            expr: sum(increase(kube_pod_container_status_restarts_total{namespace=~"ml-platform|monitoring|zulip|ml-serving"}[15m])) > 3
+            for: 5m
+            labels:
+              severity: warning
+              component: platform
+            annotations:
+              summary: "Pod restart rate is elevated"
+              description: "Tracked namespaces have seen more than 3 container restarts in 15 minutes."
+
+          - alert: PlatformNodeCpuHigh
+            expr: 100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 85
+            for: 5m
+            labels:
+              severity: warning
+              component: platform
+            annotations:
+              summary: "Node CPU usage is high"
+              description: "A node has sustained CPU usage above 85% for 5 minutes."
+
+          - alert: PlatformNodeMemoryHigh
+            expr: 100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 90
+            for: 5m
+            labels:
+              severity: warning
+              component: platform
+            annotations:
+              summary: "Node memory usage is high"
+              description: "A node has sustained memory usage above 90% for 5 minutes."
+
           - alert: PrometheusConfigLastReloadFailed
             expr: prometheus_config_last_reload_successful != 1
             for: 5m

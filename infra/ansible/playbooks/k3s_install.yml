@@ -1,25 +1,97 @@
 ---
-# Single-node k3s on the course VM; kubeconfig copied to the Ansible SSH user (~/.kube/config).
-# Prereq: inventory.ini points at the VM; SSH key permissions 0600 (not 0777 on Windows mounts).
+# Two-node k3s cluster on Chameleon: one control-plane and one worker.
+# Prereq: inventory.ini defines [control_plane] and [workers]; worker SSH goes through the control-plane jump host.
 # Run: ansible-playbook -i ../inventory.ini playbooks/k3s_install.yml
-- name: Install k3s on Chameleon VM
-  hosts: chameleon
+- name: Install k3s control-plane
+  hosts: control_plane
   become: true
   gather_facts: false
   vars:
     k3s_install_url: "https://get.k3s.io"
-    k3s_exec: "server --write-kubeconfig-mode 644"
+    control_plane_public_ip: "{{ ansible_host | default('') }}"
+    control_plane_private_ip: "{{ private_ip | default(ansible_host) }}"
+    k3s_tls_sans: >-
+      {{
+        [
+          control_plane_public_ip,
+          control_plane_private_ip
+        ]
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
   tasks:
+    - name: Wait for control-plane SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
     - name: Ensure curl is installed
       ansible.builtin.package:
         name: curl
         state: present
 
-    - name: Install k3s (single-node)
+    - name: Ensure k3s config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check whether k3s is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Write k3s server config with dynamic TLS SANs
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          write-kubeconfig-mode: "0644"
+          tls-san:
+          {% for san in k3s_tls_sans %}
+            - {{ san }}
+          {% endfor %}
+      register: k3s_server_config
+
+    - name: Install k3s server
       ansible.builtin.shell: |
-        curl -sfL {{ k3s_install_url }} | INSTALL_K3S_EXEC="{{ k3s_exec }}" sh -
+        curl -sfL {{ k3s_install_url }} | INSTALL_K3S_EXEC="server" sh -
       args:
         creates: /usr/local/bin/k3s
+
+    - name: Rotate k3s API server certificate when TLS SANs change
+      when:
+        - k3s_binary.stat.exists
+        - k3s_server_config.changed
+      block:
+        - name: Stop k3s before rotating certificates
+          ansible.builtin.service:
+            name: k3s
+            state: stopped
+
+        - name: Rotate k3s API server certificate
+          ansible.builtin.command: k3s certificate rotate --service api-server
+
+        - name: Start k3s after rotating certificates
+          ansible.builtin.service:
+            name: k3s
+            state: started
+
+    - name: Ensure k3s service is enabled and started
+      ansible.builtin.service:
+        name: k3s
+        enabled: true
+        state: started
+
+    - name: Read cluster join token
+      ansible.builtin.command: cat /var/lib/rancher/k3s/server/node-token
+      register: k3s_node_token
+      changed_when: false
 
     - name: Create kubeconfig directory for remote user
       ansible.builtin.file:
@@ -38,3 +110,28 @@
         group: "{{ ansible_user }}"
         mode: "0600"
 
+- name: Install k3s workers
+  hosts: workers
+  become: true
+  gather_facts: false
+  vars:
+    k3s_install_url: "https://get.k3s.io"
+    control_plane_host: "{{ groups['control_plane'][0] }}"
+    control_plane_private_ip: "{{ hostvars[control_plane_host].private_ip | default(hostvars[control_plane_host].ansible_host) }}"
+    k3s_token: "{{ hostvars[control_plane_host].k3s_node_token.stdout }}"
+  tasks:
+    - name: Wait for worker SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
+    - name: Ensure curl is installed
+      ansible.builtin.package:
+        name: curl
+        state: present
+
+    - name: Install k3s agent
+      ansible.builtin.shell: |
+        curl -sfL {{ k3s_install_url }} | K3S_URL="https://{{ control_plane_private_ip }}:6443" K3S_TOKEN="{{ k3s_token }}" INSTALL_K3S_EXEC="agent" sh -
+      args:
+        creates: /etc/systemd/system/k3s-agent.service

@@ -1,65 +1,143 @@
-# MLOps Project - Zulip on Chameleon
+# Multi-Tone Communication Assistant for Zulip
 
-This repository tracks my DevOps/platform work for the MLOps course project: provisioning and operating a self-hosted Zulip + platform services stack on Chameleon Cloud using Infrastructure as Code and Configuration as Code.
+This repository contains the infrastructure, Kubernetes manifests, training code, serving code, and Zulip integration needed to run the project end to end on Chameleon Cloud.
 
-## Project objective
+## What is in this repo
 
-Build a reproducible deployment pipeline from cloud resources to running Kubernetes workloads:
+- OpenStack + networking provisioning with Terraform
+- Two-node k3s cluster bootstrap with Ansible
+- Shared platform services: MLflow, MinIO, Prometheus, Grafana
+- Centralized runtime secrets through Sealed Secrets
+- Scheduled backups from stateful services into Chameleon object storage
+- Zulip deployment through the docker-zulip Helm chart
+- Data, training, model registration, and serving workloads
+- Zulip bridge and custom Zulip UI integration for tone suggestions
 
-- Provision OpenStack infrastructure on Chameleon (`KVM@TACC`) with Terraform.
-- Configure and operate Kubernetes (k3s) with Ansible.
-- Deploy platform services (MLflow, MinIO) and application service (Zulip via Helm).
-- Document the full engineering flow, issues, fixes, and operational evidence.
+## Current architecture
 
-## Current implementation status
+- `control-plane` node: public floating IP, cluster admin operations, core platform access
+- `worker` node: additional cluster capacity for workloads
+- Namespaces:
+  - `ml-platform`: MLflow, MinIO
+  - `monitoring`: Prometheus, Grafana, Alertmanager
+  - `zulip`: Zulip application and its backing services
+  - `ml-data`: ingest, batch, and online data services
+  - `ml-training`: training jobs and registry jobs
+  - `ml-serving`: classifier, generator, bridge, ingress
 
-- OpenStack VM + networking + floating IP provisioned and reachable.
-- k3s installed and verified (default **Traefik** ingress controller).
-- **MLflow** in `ml-platform`: Deployment + PVC + ClusterIP Service + **Ingress** (`mlflow.<fip>.nip.io`), TLS via shared secret `chameleon-nip-tls` (self-signed for demos).
-- **MinIO** in `ml-platform`: S3-compatible API + web console; **Ingresses** `minio.<fip>.nip.io` and `minio-console.<fip>.nip.io`; credentials in Secret `minio-root` (bootstrapped by `deploy_platform.yml`).
-- **Prometheus** + **Grafana** in `monitoring`: PVC-backed TSDB and Grafana data; **Ingress** for Grafana (`grafana.<fip>.nip.io`) and optional public **Ingress** for Prometheus (`prometheus.<fip>.nip.io`) in `k8s/platform/observability/`.
-- **Zulip** from `docker-zulip/helm/zulip`: ClusterIP Service + **Ingress** (`zulip.<fip>.nip.io`), same TLS pattern; values in `k8s/zulip/values-chameleon.yaml` include proxy trust (`LOADBALANCER_IPS` / `SETTING_*`) for Traefik.
-- Browser access: **HTTPS** on port **443** (OpenStack SG must allow **80** and **443**). Chrome shows “Not secure” for self-signed certs until trusted or replaced with Let’s Encrypt.
-- Org creation: **`/new/`** enabled for class demos via `SETTING_OPEN_REALM_CREATION` (see docs); single-use CLI links still work.
-- Detailed ops docs: keep under `Docs/` locally (that tree is **not** tracked in Git; see `.gitignore`).
+## End-To-End Architecture
 
-## Repository structure
+```mermaid
+flowchart TB
+    subgraph Frontend["Frontend / User Layer"]
+        U["Zulip compose UI"]
+    end
 
-- [`GETTING_STARTED.md`](GETTING_STARTED.md) — **end-to-end usage**: what is implemented and command-by-command runbook (outside `Docs/`).
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — system diagram and IaC/CaC split.
-- [`infrastructure-requirements.md`](infrastructure-requirements.md) — **DevOps deliverable**: CPU/memory/PVC table, Chameleon right-sizing evidence template, Zulip vs platform split.
-- `Docs/` — milestone PDFs and personal write-ups **local only** (gitignored). The joint **container ↔ manifest** table lives in [`k8s/containers-matrix.md`](k8s/containers-matrix.md).
-- `infra/`
-  - `terraform/openstack/`: Chameleon infrastructure provisioning (VM/network/FIP).
-  - `terraform/k8s-apps/`: optional Terraform-managed k8s app path.
-  - `ansible/`: k3s install and app deployment playbooks.
-- `k8s/`
-  - Kubernetes manifests and Helm value overlays (MLflow, MinIO, Prometheus/Grafana, Zulip, teammate training/serving/data workloads). Index: [`k8s/README.md`](k8s/README.md). **Container ↔ Dockerfile / manifest table:** [`k8s/containers-matrix.md`](k8s/containers-matrix.md).
-- `contracts/`
-  - Sample request/response artifacts used by project milestones.
-- `zulip/`
-  - Upstream Zulip source checkout used for product/context reference.
+    subgraph Inference["Live Inference Layer"]
+        B["Zulip Bridge"]
+        G["Generator Service"]
+        C["Classifier Service"]
+    end
 
-## How this repo is used
+    subgraph Storage["Shared State / Artifacts"]
+        M["MinIO"]
+        ML["MLflow"]
+    end
 
-1. Provision cloud resources via Terraform.
-2. Configure cluster and apply platform workloads via Ansible.
-3. Deploy Zulip with Helm values tuned for Chameleon/k3s.
-4. Validate runtime with `kubectl` and capture evidence for milestone deliverables.
+    subgraph Data["Data Pipeline"]
+        BP["Batch Pipeline"]
+        RT["Retrain Trigger"]
+    end
 
-## Notes
+    subgraph Train["Training / Registry"]
+        CT["Classifier Training Job"]
+        GT["Generator Training Job"]
+        RG["Register + Alias Job"]
+    end
 
-- This is a personal working repository for my DevOps track deliverables.
-- Secrets are not committed (`values-secret.yaml`, credentials, private keys are excluded via `.gitignore`).
-- For a **public** clone: see [`SECURITY.md`](SECURITY.md). Tracked Ingress YAML may pin **one** team floating IP (`*.nip.io`); replace with **your** IP, TLS SANs, and `SETTING_EXTERNAL_HOST` before apply.
+    subgraph Automation["Automation / Deploy"]
+        GA["GitHub Actions retrain-on-trigger.yml"]
+        SRV["Serving Deployments<br/>staging / canary / prod"]
+    end
 
-## Before you push (quick check)
+    U --> B
+    B --> G
+    G --> C
+    C --> G
+    G --> B
+    B --> U
 
-From the repo root (Git Bash or similar):
+    B --> M
+    BP --> M
+    RT --> M
+    CT --> M
+    GT --> M
 
-```bash
-git grep -i "BEGIN.*PRIVATE KEY" -- infra k8s README.md GETTING_STARTED.md ARCHITECTURE.md SECURITY.md 2>/dev/null || true
-git grep -i "application_credential_secret" -- "*.tf" "*.yaml" "*.yml" 2>/dev/null || true
+    CT --> ML
+    GT --> ML
+    RG --> ML
+
+    M --> BP
+    M --> RT
+    ML --> RT
+    M --> GA
+    GA --> BP
+    GA --> CT
+    GA --> GT
+    GA --> RG
+    RG --> SRV
+    SRV --> G
+    SRV --> C
 ```
 
-Inspect any unexpected hits. Paths like `terraform.tfvars` and `inventory.ini` must stay untracked (see `.gitignore`).
+High-level request path:
+
+1. User types a draft in Zulip and clicks `Tone suggestions`.
+2. The Zulip bridge forwards the draft to the generator service.
+3. The generator uses the classifier-backed serving stack to produce `formal`, `friendly`, and `neutral` variants.
+4. Suggestions are shown in Zulip.
+5. User actions and edits are persisted as feedback in MinIO.
+6. Batch and retraining automation use that feedback to build new datasets, train new models, register them in MLflow, and update serving aliases.
+
+## Documentation map
+
+- [GETTING_STARTED.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\GETTING_STARTED.md): full bring-up order
+- [ARCHITECTURE.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\ARCHITECTURE.md): system layout and runtime flow
+- [PIPELINE.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\PIPELINE.md): full user-to-serving-to-feedback-to-retraining walkthrough
+- [infra/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\README.md): infrastructure entry point
+- [k8s/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\README.md): Kubernetes manifest map
+- [k8s/training/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\training\README.md): training, retraining, feedback, and registry verification
+- [serving/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\serving\README.md): serving stack and smoke tests
+- [training_proj15-main/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\training_proj15-main\README.md): training code and MLflow flow
+- [SECURITY.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\SECURITY.md): secrets and public-repo hygiene
+
+## Bring-up summary
+
+1. Run [run-terraform](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\run-terraform) to provision OpenStack resources and generate inventory.
+2. Run [run-ansible](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\run-ansible) to bootstrap k3s, runtime secrets, TLS, block storage wiring, platform services, Zulip, ML workloads, and optional object-storage backups.
+3. For normal reruns on an existing cluster, use `./infra/run-ansible --skip-pvc-migration`.
+4. Use PVC migration only as a one-time storage move or explicit recovery step.
+5. Verify data, training, serving, backups, dashboards, and Zulip tone suggestions.
+
+## Important operational notes
+
+- Secrets are not committed. You still need local `terraform.tfvars` and `inventory.ini`. TLS and Zulip secret values are auto-generated by Ansible unless you provide overrides.
+- Runtime persistence is block-volume-backed on the control-plane through `/mnt/block/local-path-provisioner`, not root-disk-only ephemeral `local-path`.
+- The ML workloads playbook now waits for data jobs, training jobs, serving deployments, bridge rollout, and the registry job.
+- The tone generator serving path includes a mounted copy of the current generator logic so cluster behavior matches the repo source.
+- Grafana includes a live `Data Monitoring and Quality` dashboard for bridge feedback, feature-log throughput, job health, and pod restarts.
+- The bridge feedback panels depend on Prometheus scraping the `zulip-bridge` metrics endpoint, which is enabled in the bridge deployment manifest.
+- Self-signed `*.nip.io` certificates are acceptable for demos, but browsers will warn until you trust or replace them.
+
+## Operations quick runbook
+
+Normal operator actions:
+
+- clean bring-up: `./infra/run-terraform --action apply --write-inventory` then `./infra/run-ansible`
+- safe rerun on an existing cluster: `./infra/run-ansible --skip-pvc-migration`
+- inspect cluster health: `kubectl get nodes && kubectl get pods -A`
+- inspect platform health: `kubectl get pods,svc,ingress -n ml-platform && kubectl get pods,svc,ingress -n monitoring`
+- inspect Zulip and serving health: `kubectl get pods,svc,ingress -n zulip && kubectl get pods,svc -n ml-serving`
+- inspect backups: `kubectl get cronjobs,jobs -n zulip && kubectl get cronjobs,jobs -n ml-platform && kubectl get cronjobs,jobs -n monitoring`
+
+Use PVC migration only when you are intentionally moving existing state onto the block-backed path or performing explicit storage recovery. It is not part of the normal rerun path.

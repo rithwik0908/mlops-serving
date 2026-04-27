@@ -12,5 +12,9 @@ spec:
               value: "http://classifier-pytorch-canary:8001"
             - name: DUMMY_MODE
               value: "false"
+            - name: GENERATOR_BACKEND
+              value: "causal"
+            - name: GENERATOR_MODEL_URI
+              value: "models:/tone-generator-lora@canary"
             - name: DEPLOYMENT_TIER
               value: "canary"

@@ -20,12 +20,21 @@ spec:
         role: data
     spec:
       restartPolicy: OnFailure
-      imagePullSecrets:
-        - name: ghcr-pull
+      volumes:
+        - name: ingest-code
+          configMap:
+            name: data-ingest-code
       containers:
         - name: ingest
-          image: ghcr.io/allusudharshanrao/mlops-data-ingest:latest
+          image: python:3.11-slim
           imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              python -m pip install --no-cache-dir -r /app/requirements.txt
+              python /app/ingest.py
           env:
             - name: MINIO_BUCKET
               value: "zulip-rewriter"
@@ -50,3 +59,6 @@ spec:
             limits:
               cpu: "1"
               memory: 2Gi
+          volumeMounts:
+            - name: ingest-code
+              mountPath: /app

@@ -1,6 +1,5 @@
 # Helm / release suffix (align with k8s/zulip values, e.g. zulip-proj15)
 project_id_suffix     = "proj15"
-# Use .../v3 for Keystone v3 (Chameleon KVM@TACC)
 openstack_auth_url    = "https://kvm.tacc.chameleoncloud.org:5000/v3"
 openstack_region      = "KVM@TACC"
 
@@ -8,38 +7,46 @@ openstack_region      = "KVM@TACC"
 openstack_tenant_name = ""
 openstack_user_name   = ""
 
-# Project UUID from Horizon (Identity → Application Credentials → Project ID); helps Terraform auth with app credentials.
-# Lease System_Integration_proj15 (same project as Blazar reservation below).
+# Project UUID from Horizon (Identity -> Application Credentials -> Project ID)
 openstack_tenant_id = "89f528973fea4b3a981f9b2344e522de"
 
-# Preferred on Chameleon with SSO: create in Horizon → Identity → Application Credentials
+# Preferred on Chameleon with SSO: create in Horizon -> Identity -> Application Credentials
 # Do NOT commit real values; use TF_VAR_* or env OS_APPLICATION_CREDENTIAL_*
 application_credential_id     = ""
 application_credential_secret = ""
 
-# Required: image + network. For Blazar instance reservations (KVM@TACC), set blazar_reservation_id
-# and omit flavor or set flavor_name only when blazar_reservation_id is empty.
-image_name   = "CC-Ubuntu24.04"
-# Ignored when blazar_reservation_id is set (Blazar supplies flavor via reservation).
-flavor_name  = "m1.xxlarge"
-# OpenStack keypair *name* (Compute → Key Pairs), not the local .pem filename
-key_pair     = "your_keypair_name"
-network_id   = "00000000-0000-0000-0000-000000000000"
-# Optional but recommended if your network has multiple subnets: subnet UUID (Horizon → Network → Subnets)
+# Required: image + network. For Blazar instance reservations (KVM@TACC), set the control-plane
+# and worker reservation IDs below. The legacy blazar_reservation_id remains as a fallback for
+# single-node use, but the two-node fields are the intended path now.
+image_name  = "CC-Ubuntu24.04"
+flavor_name = "m1.xxlarge"
+key_pair    = "your_keypair_name"
+network_id  = "00000000-0000-0000-0000-000000000000"
+# Optional but recommended if your network has multiple subnets: subnet UUID (Horizon -> Network -> Subnets)
 # subnet_id = "00000000-0000-0000-0000-000000000000"
+
+# Existing project security groups can stay here. Terraform also adds a managed group that opens
+# SSH, HTTP, HTTPS, and the internal k3s ports needed for the worker to join the control-plane.
 security_groups = ["default"]
-# floating_ip_pool     = "public"
 
-# --- Blazar lease: System_Integration_proj15 (KVM@TACC) ---
-# Lease id:     8b52d264-ccf7-46d7-86d7-e10e0e2aac80
-# Project id:   89f528973fea4b3a981f9b2344e522de
-# Start (UTC):  2026-04-18 20:10  |  End (UTC): 2026-04-29 05:00
-# Reservation:  1× instance, flavor m1.xxlarge (16 vCPU, 32768 MiB RAM, 40 GB disk), trait GPU forbidden
-# Horizon path: Leases → this lease → Reservations → id (must match flavor_id / reservation UUID below).
-# Lease is ACTIVE — run terraform plan/apply. Re-check Horizon if apply errors on capacity.
-blazar_reservation_id = "7761d93f-8947-4fd7-b922-defe7dd7c024"
+# Lease / reservation IDs for the 2-node cluster
+control_plane_blazar_reservation_id = "e1d04262-b87a-45fa-990e-6f59b069e8c8"
+worker_blazar_reservation_id        = "6a393bb4-962b-41cd-9be3-14b819c76966"
 
-# Set false only if your project network already has a router to "public"
-create_public_router = true
+# Legacy single-node fallback. Leave empty when using the 2-node reservations above.
+blazar_reservation_id = ""
 
-install_k3s_cloud_init = false
+create_public_router    = true
+install_k3s_cloud_init  = false
+
+# Persistent control-plane block storage:
+# Recommended pattern for rebuilds is to create the volume once, then keep reusing its UUID.
+# Set attach_block_volume=true and provide existing_block_volume_id to have Terraform reattach it.
+# If you want Terraform to create the first volume for you, set create_block_volume=true as well.
+attach_block_volume     = false
+existing_block_volume_id = ""
+create_block_volume     = false
+block_volume_name       = "block-data-proj15"
+block_volume_size_gib   = 150
+block_volume_type       = "ceph-ssd"
+block_volume_availability_zone = "nova"

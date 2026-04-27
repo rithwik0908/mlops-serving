@@ -17,6 +17,8 @@ spec:
       labels:
         app: minio
     spec:
+      nodeSelector:
+        mlops.storage: block
       securityContext:
         fsGroup: 1000
         runAsUser: 1000
@@ -48,9 +50,9 @@ spec:
                   key: root-password
             # Public URLs behind Ingress/TLS (edit if your floating IP / hosts differ).
             - name: MINIO_SERVER_URL
-              value: "https://minio.129.114.27.192.nip.io"
+              value: "https://minio.FLOATING_IP_PLACEHOLDER.nip.io"
             - name: MINIO_BROWSER_REDIRECT_URL
-              value: "https://minio-console.129.114.27.192.nip.io"
+              value: "https://minio-console.FLOATING_IP_PLACEHOLDER.nip.io"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -68,8 +70,8 @@ spec:
             periodSeconds: 20
           resources:
             requests:
-              cpu: "200m"
-              memory: 384Mi
+              cpu: "250m"
+              memory: 512Mi
             limits:
               cpu: "1"
               memory: 2Gi

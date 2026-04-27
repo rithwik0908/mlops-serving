@@ -13,5 +13,9 @@ spec:
               value: "http://classifier-pytorch-prod:8001"
             - name: DUMMY_MODE
               value: "false"
+            - name: GENERATOR_BACKEND
+              value: "causal"
+            - name: GENERATOR_MODEL_URI
+              value: "models:/tone-generator-lora@prod"
             - name: DEPLOYMENT_TIER
               value: "production"

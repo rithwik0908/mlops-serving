@@ -5,6 +5,9 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ml-data
 resources:
+  - data-ingest-configmap.yaml
+  - data-batch-configmap.yaml
+  - retrain-trigger-configmap.yaml
   - minio-bucket-init-job.yaml
   - data-online-service.yaml
   - data-online-deployment.yaml

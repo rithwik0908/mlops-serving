@@ -50,6 +50,29 @@ FEEDBACK_COUNTER = Counter(
     "User feedback signals received",
     ["user_action", "tone_shown"],
 )
+FEATURE_LOG_COUNTER = Counter(
+    "bridge_feature_log_total",
+    "Production request feature logs written for drift detection",
+)
+
+POLITE_MARKERS = [
+    r"\bplease\b",
+    r"\bthank\b",
+    r"\bcould you\b",
+    r"\bwould you\b",
+    r"\bi appreciate\b",
+    r"\bkindly\b",
+]
+INFORMAL_MARKERS = [
+    r"\bhey\b",
+    r"\byo\b",
+    r"\bu\b",
+    r"\bgonna\b",
+    r"\bwanna\b",
+    r"\bbtw\b",
+    r"\bomg\b",
+    r"\blol\b",
+]
 
 
 def _s3_client():
@@ -80,6 +103,50 @@ def _write_feedback_to_minio(record: dict) -> None:
         logger.info("feedback persisted key=%s", key)
     except Exception as exc:  # noqa: BLE001
         logger.warning("feedback MinIO write failed (non-fatal): %s", exc)
+
+
+def _extract_text_features(text: str) -> dict[str, float | int]:
+    tl = text.lower()
+    words = tl.split()
+    polite = sum(1 for pattern in POLITE_MARKERS if re.search(pattern, tl))
+    informal = sum(1 for pattern in INFORMAL_MARKERS if re.search(pattern, tl))
+    return {
+        "word_count": len(words),
+        "char_count": len(text),
+        "polite_marker_count": polite,
+        "informal_marker_count": informal,
+        "has_question_mark": int("?" in text),
+        "has_exclamation": int("!" in text),
+        "estimated_formality": round((polite - informal) / max(len(words), 1), 4),
+    }
+
+
+def _write_feature_log_to_minio(message_id: str, text: str, message_type: str) -> None:
+    """Persist privacy-preserving live request features for drift detection."""
+    if not _MINIO_ACCESS_KEY:
+        logger.debug("MINIO_ACCESS_KEY not set — feature log not persisted")
+        return
+
+    now = datetime.now(timezone.utc)
+    record = {
+        "log_id": str(uuid.uuid4()),
+        "message_id": message_id,
+        "message_type": message_type,
+        "created_at": now.isoformat(),
+        "features": _extract_text_features(text),
+    }
+    key = f"feature_logs/{now.strftime('%Y-%m-%d')}/{record['log_id']}_{message_id}.json"
+    try:
+        _s3_client().put_object(
+            Bucket=_MINIO_BUCKET,
+            Key=key,
+            Body=json.dumps(record, ensure_ascii=False).encode(),
+            ContentType="application/json",
+        )
+        FEATURE_LOG_COUNTER.inc()
+        logger.info("feature log persisted key=%s", key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("feature log MinIO write failed (non-fatal): %s", exc)
 
 app = FastAPI(title="Zulip tone bridge", version="1.0.0")
 
@@ -251,6 +318,11 @@ async def zulip_webhook(request: Request) -> JSONResponse:
         "text": text,
         "message_type": str(payload.get("message_type") or "stream"),
     }
+    _write_feature_log_to_minio(
+        message_id=message_id,
+        text=text,
+        message_type=gen_payload["message_type"],
+    )
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client_http:

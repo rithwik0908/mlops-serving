@@ -8,6 +8,8 @@ metadata:
     app: prometheus
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: prometheus
@@ -16,6 +18,8 @@ spec:
       labels:
         app: prometheus
     spec:
+      nodeSelector:
+        mlops.storage: block
       serviceAccountName: prometheus
       securityContext:
         fsGroup: 65534
@@ -29,6 +33,7 @@ spec:
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=15d
             - --web.enable-lifecycle
+            - --web.enable-admin-api
           ports:
             - containerPort: 9090
               name: http
@@ -40,8 +45,8 @@ spec:
               mountPath: /prometheus
           resources:
             requests:
-              cpu: "150m"
-              memory: 384Mi
+              cpu: "200m"
+              memory: 512Mi
             limits:
               cpu: "1"
               memory: 2Gi

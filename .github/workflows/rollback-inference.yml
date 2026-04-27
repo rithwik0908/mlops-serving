@@ -41,6 +41,49 @@ jobs:
           echo "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
           chmod 600 "$RUNNER_TEMP/kubeconfig"
 
+      - name: Tunnel Kubernetes API over SSH
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          CONTROL_PLANE_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          CONTROL_PLANE_USER: ${{ vars.CONTROL_PLANE_USER }}
+          CONTROL_PLANE_SSH_KEY: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTROL_PLANE_HOST:-}" ] || [ -z "${CONTROL_PLANE_USER:-}" ]; then
+            echo "::error::Missing Actions variables CONTROL_PLANE_HOST and/or CONTROL_PLANE_USER."
+            exit 1
+          fi
+          if [ -z "${CONTROL_PLANE_SSH_KEY:-}" ]; then
+            echo "::error::Missing repository secret CONTROL_PLANE_SSH_KEY."
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CONTROL_PLANE_SSH_KEY" > ~/.ssh/control_plane_key
+          chmod 600 ~/.ssh/control_plane_key
+          ssh-keyscan -H "$CONTROL_PLANE_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/control_plane_key \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -N -f \
+            -L 6443:127.0.0.1:6443 \
+            "${CONTROL_PLANE_USER}@${CONTROL_PLANE_HOST}"
+
+          CLUSTER_NAME="$(kubectl config view --kubeconfig "$KUBECONFIG" -o jsonpath='{.clusters[0].name}')"
+          kubectl config set-cluster "$CLUSTER_NAME" \
+            --server=https://127.0.0.1:6443 \
+            --kubeconfig "$KUBECONFIG" >/dev/null
+
+      - name: Verify cluster API reachability
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kubectl --request-timeout=15s cluster-info
+
       - name: kubectl rollout undo
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
@@ -49,10 +92,10 @@ jobs:
           NS=ml-serving
           TIER="${{ inputs.tier_suffix }}"
           if [ "${{ inputs.rollback_classifier }}" = "true" ]; then
-            kubectl rollout undo "deployment/classifier-pytorch-${TIER}" -n "$NS"
-            kubectl rollout status "deployment/classifier-pytorch-${TIER}" -n "$NS" --timeout=600s
+            kubectl --request-timeout=30s rollout undo "deployment/classifier-pytorch-${TIER}" -n "$NS"
+            kubectl --request-timeout=30s rollout status "deployment/classifier-pytorch-${TIER}" -n "$NS" --timeout=600s
           fi
           if [ "${{ inputs.rollback_generator }}" = "true" ]; then
-            kubectl rollout undo "deployment/tone-generator-${TIER}" -n "$NS"
-            kubectl rollout status "deployment/tone-generator-${TIER}" -n "$NS" --timeout=600s
+            kubectl --request-timeout=30s rollout undo "deployment/tone-generator-${TIER}" -n "$NS"
+            kubectl --request-timeout=30s rollout status "deployment/tone-generator-${TIER}" -n "$NS" --timeout=600s
           fi

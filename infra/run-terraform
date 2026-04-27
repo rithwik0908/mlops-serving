@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TERRAFORM_DIR="${TERRAFORM_DIR:-${SCRIPT_DIR}/terraform/openstack}"
+INVENTORY_OUTPUT_PATH="${INVENTORY_OUTPUT_PATH:-${SCRIPT_DIR}/ansible/inventory.ini}"
+ACTION="apply"
+AUTO_APPROVE=false
+SKIP_INIT=false
+WRITE_INVENTORY=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./infra/run-terraform [options]
+
+Options:
+  --action plan|apply|destroy
+  --terraform-dir PATH
+  --inventory-output PATH
+  --auto-approve
+  --skip-init
+  --write-inventory
+  -h, --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --action)
+      ACTION="$2"
+      shift 2
+      ;;
+    --terraform-dir)
+      TERRAFORM_DIR="$2"
+      shift 2
+      ;;
+    --inventory-output)
+      INVENTORY_OUTPUT_PATH="$2"
+      shift 2
+      ;;
+    --auto-approve)
+      AUTO_APPROVE=true
+      shift
+      ;;
+    --skip-init)
+      SKIP_INIT=true
+      shift
+      ;;
+    --write-inventory)
+      WRITE_INVENTORY=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "${ACTION}" != "plan" && "${ACTION}" != "apply" && "${ACTION}" != "destroy" ]]; then
+  echo "Invalid action: ${ACTION}" >&2
+  exit 2
+fi
+
+if [[ ! -d "${TERRAFORM_DIR}" ]]; then
+  echo "Terraform directory not found: ${TERRAFORM_DIR}" >&2
+  exit 1
+fi
+
+if ! command -v terraform >/dev/null 2>&1; then
+  echo "Could not find terraform on PATH." >&2
+  exit 1
+fi
+
+if [[ ! -f "${TERRAFORM_DIR}/terraform.tfvars" ]]; then
+  echo "Missing terraform.tfvars in ${TERRAFORM_DIR}" >&2
+  exit 1
+fi
+
+run_terraform() {
+  echo
+  echo "==> terraform $*"
+  (
+    cd "${TERRAFORM_DIR}"
+    terraform "$@"
+  )
+}
+
+echo "Running Terraform from ${TERRAFORM_DIR}"
+
+if [[ "${SKIP_INIT}" == false ]]; then
+  run_terraform init
+fi
+
+case "${ACTION}" in
+  plan)
+    run_terraform plan
+    ;;
+  apply)
+    PLAN_FILE="tfplan"
+    run_terraform plan -out="${PLAN_FILE}"
+    if [[ "${AUTO_APPROVE}" == true ]]; then
+      run_terraform apply -auto-approve "${PLAN_FILE}"
+    else
+      run_terraform apply "${PLAN_FILE}"
+    fi
+    ;;
+  destroy)
+    if [[ "${AUTO_APPROVE}" == true ]]; then
+      run_terraform destroy -auto-approve
+    else
+      run_terraform destroy
+    fi
+    ;;
+esac
+
+if [[ "${WRITE_INVENTORY}" == true && "${ACTION}" == "apply" ]]; then
+  echo
+  echo "==> writing generated inventory to ${INVENTORY_OUTPUT_PATH}"
+  mkdir -p "$(dirname "${INVENTORY_OUTPUT_PATH}")"
+  (
+    cd "${TERRAFORM_DIR}"
+    terraform output -raw ansible_inventory_ini > "${INVENTORY_OUTPUT_PATH}"
+  )
+fi
+
+echo
+echo "Terraform ${ACTION} completed."

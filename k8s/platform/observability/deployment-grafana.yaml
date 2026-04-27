@@ -18,6 +18,8 @@ spec:
       labels:
         app: grafana
     spec:
+      nodeSelector:
+        mlops.storage: block
       securityContext:
         fsGroup: 472
       containers:
@@ -35,7 +37,7 @@ spec:
                   name: grafana-admin
                   key: admin-password
             - name: GF_SERVER_ROOT_URL
-              value: https://grafana.129.114.27.192.nip.io/
+              value: https://grafana.FLOATING_IP_PLACEHOLDER.nip.io/
             - name: GF_INSTALL_PLUGINS
               value: ""
           volumeMounts:
@@ -46,12 +48,11 @@ spec:
             - name: dashboard-provider
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboard-ml-serving
-              mountPath: /etc/grafana/provisioning/dashboards/mlops/ml-serving-tone.json
-              subPath: ml-serving-tone.json
+              mountPath: /etc/grafana/provisioning/dashboards/mlops
           resources:
             requests:
               cpu: "100m"
-              memory: 192Mi
+              memory: 256Mi
             limits:
               cpu: "500m"
               memory: 1Gi

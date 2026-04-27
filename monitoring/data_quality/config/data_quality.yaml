@@ -1,0 +1,27 @@
+storage:
+  endpoint_url: "http://localhost:9000"
+  bucket: "zulip-rewriter"
+  access_key_env: "MINIO_ACCESS_KEY"
+  secret_key_env: "MINIO_SECRET_KEY"
+  verify_ssl: false
+  addressing_style: "path"
+
+dataset:
+  raw_version: "v1"
+  batch_version: "v1_batch_2026-04-23"
+  lookback_days: 7
+
+thresholds:
+  max_null_text_rate: 0.01
+  max_duplicate_text_rate: 0.10
+  max_invalid_label_rate: 0.00
+  min_train_rows: 20
+  min_feedback_approval_rate: 0.70
+  max_online_error_rate: 0.10
+  max_missing_preferred_text_rate: 0.80
+  max_word_count_drift_psi: 0.20
+  max_formality_drift_psi: 0.20
+
+reports:
+  json_path: "reports/data_quality_report.json"
+  markdown_path: "reports/data_quality_report.md"

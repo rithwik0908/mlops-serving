@@ -24,6 +24,8 @@ spec:
       # MLflow UI does not expose Prometheus /metrics on :5000 — do not annotate for pod scrape
       # (Prometheus would 404). Use mlflow-export or a sidecar if you need MLflow metrics later.
     spec:
+      nodeSelector:
+        mlops.storage: block
       containers:
         - name: mlflow
           image: ghcr.io/mlflow/mlflow:v2.14.3
@@ -62,8 +64,8 @@ spec:
               mountPath: /mlflow/data
           resources:
             requests:
-              cpu: "200m"
-              memory: 384Mi
+              cpu: "250m"
+              memory: 512Mi
             limits:
               cpu: "1"
               memory: 2Gi

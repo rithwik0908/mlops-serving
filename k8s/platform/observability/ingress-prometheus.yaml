@@ -12,9 +12,9 @@ spec:
   tls:
     - secretName: chameleon-nip-tls
       hosts:
-        - prometheus.129.114.27.192.nip.io
+        - prometheus.FLOATING_IP_PLACEHOLDER.nip.io
   rules:
-    - host: prometheus.129.114.27.192.nip.io
+    - host: prometheus.FLOATING_IP_PLACEHOLDER.nip.io
       http:
         paths:
           - path: /

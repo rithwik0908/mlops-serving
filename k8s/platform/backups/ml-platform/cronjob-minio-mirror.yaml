@@ -1,0 +1,85 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: minio-bucket-mirror
+  namespace: ml-platform
+  labels:
+    app: backup
+    component: minio
+spec:
+  schedule: "15 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: backup
+            component: minio
+        spec:
+          nodeSelector:
+            mlops.storage: block
+          restartPolicy: Never
+          containers:
+            - name: minio-mirror
+              image: minio/mc:RELEASE.2025-02-08T19-14-21Z
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  SNAPSHOT_DATE="$(date -u +%F)"
+                  mc alias set source http://minio.ml-platform.svc.cluster.local:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+                  mc alias set backup "$OBJECTSTORE_ENDPOINT" "$OBJECTSTORE_ACCESS_KEY" "$OBJECTSTORE_SECRET_KEY" --api S3v4
+                  DEST_PATH="backup/${OBJECTSTORE_BUCKET}/${OBJECTSTORE_PREFIX}/ml-platform/minio/${SNAPSHOT_DATE}/zulip-rewriter"
+                  mc mirror --overwrite source/zulip-rewriter "${DEST_PATH}"
+                  echo "mirrored source/zulip-rewriter -> ${DEST_PATH}"
+              env:
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-root
+                      key: root-user
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-root
+                      key: root-password
+                - name: OBJECTSTORE_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: endpoint
+                - name: OBJECTSTORE_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: bucket
+                - name: OBJECTSTORE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: prefix
+                - name: OBJECTSTORE_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: access-key
+                - name: OBJECTSTORE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: secret-key
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: 128Mi
+                limits:
+                  cpu: "500m"
+                  memory: 256Mi

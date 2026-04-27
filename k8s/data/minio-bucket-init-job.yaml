@@ -41,5 +41,17 @@ spec:
             - -c
             - |
               set -eu
-              mc alias set platform "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+              TRIES=0
+              MAX=24
+              until mc alias set platform "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/dev/null 2>&1; do
+                TRIES=$((TRIES+1))
+                if [ "$TRIES" -ge "$MAX" ]; then
+                  echo "ERROR: MinIO at $MINIO_ENDPOINT not reachable after $((MAX*5))s - aborting"
+                  exit 1
+                fi
+                echo "MinIO not ready (attempt $TRIES/$MAX), sleeping 5s..."
+                sleep 5
+              done
+              echo "MinIO reachable. Creating bucket..."
               mc mb --ignore-existing "platform/$MINIO_BUCKET"
+              echo "Bucket $MINIO_BUCKET ready."

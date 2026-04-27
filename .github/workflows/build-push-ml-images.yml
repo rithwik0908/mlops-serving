@@ -6,7 +6,7 @@ name: Build and push ML images
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main, master, DevOps]
     paths:
       - "data/**"
       - "serving/**"

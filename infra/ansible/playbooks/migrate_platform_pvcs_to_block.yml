@@ -1,0 +1,80 @@
+---
+# Safely migrate existing platform PVC data from root-disk local-path storage to the
+# block-backed local-path directory configured by prepare_block_storage.yml.
+# This playbook is intentionally serialized and keeps per-service downtime contained.
+- name: Migrate platform PVCs onto block-backed local-path storage
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars:
+    kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
+    repo_root: "/opt/mlops_project"
+    backup_root: "/mnt/block/backups/pvc-migration"
+    block_node_label_key: "mlops.storage"
+    block_node_label_value: "block"
+    migration_services:
+      - name: minio
+        namespace: ml-platform
+        deployment: minio
+        app_label: minio
+        pvc_name: minio-data
+        pvc_manifest: "{{ repo_root }}/k8s/platform/minio/pvc.yaml"
+        mount_path: /from
+        restore_path: /to
+      - name: mlflow
+        namespace: ml-platform
+        deployment: mlflow
+        app_label: mlflow
+        pvc_name: mlflow-data
+        pvc_manifest: "{{ repo_root }}/k8s/platform/mlflow/pvc.yaml"
+        mount_path: /from
+        restore_path: /to
+      - name: prometheus
+        namespace: monitoring
+        deployment: prometheus
+        app_label: prometheus
+        pvc_name: prometheus-data
+        pvc_manifest: "{{ repo_root }}/k8s/platform/observability/pvc-prometheus.yaml"
+        mount_path: /from
+        restore_path: /to
+      - name: grafana
+        namespace: monitoring
+        deployment: grafana
+        app_label: grafana
+        pvc_name: grafana-data
+        pvc_manifest: "{{ repo_root }}/k8s/platform/observability/pvc-grafana.yaml"
+        mount_path: /from
+        restore_path: /to
+  tasks:
+    - name: Wait for control-plane SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
+    - name: Ensure migration backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_root }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Read control-plane node name
+      ansible.builtin.command: hostname
+      register: control_plane_node_name
+      changed_when: false
+
+    - name: Verify block-storage node label is present
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        get node {{ control_plane_node_name.stdout }}
+        -o jsonpath={.metadata.labels.{{ block_node_label_key | replace('.', '\\.') }}}
+      register: block_node_label
+      changed_when: false
+      failed_when: block_node_label.stdout != block_node_label_value
+
+    - name: Migrate each platform PVC to block-backed local-path
+      ansible.builtin.include_tasks: "../tasks/migrate_single_pvc.yml"
+      loop: "{{ migration_services }}"
+      loop_control:
+        loop_var: migration_service

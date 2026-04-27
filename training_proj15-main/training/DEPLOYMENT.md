@@ -1,32 +1,29 @@
-# Deployment notes (Chameleon / MLflow)
+# Training Deployment Notes
 
-## Environment variables
+This training code is intended to run either in containers locally or through the Kubernetes jobs in `k8s/training/`.
 
-| Variable | Purpose |
-|----------|---------|
-| `MLFLOW_TRACKING_URI` | Tracking server URL. On the same VM as `mlflow server`: `http://127.0.0.1:5000`. From another host: `http://<FLOATING_IP>:5000`. |
-| `GIT_SHA` | Optional; Docker build-arg so runs log `code_version_git_sha`. |
+## Environment
 
-## MLflow server
+- `MLFLOW_TRACKING_URI`
+- `MLFLOW_S3_ENDPOINT_URL`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_S3_FORCE_PATH_STYLE=true`
 
-- Bind for remote access: `--host 0.0.0.0 --port 5000`.
-- If the UI reports invalid host or CORS errors, add your public URL (including port) to server flags supported by your MLflow version (`--allowed-hosts`, `--cors-allowed-origins`, etc.).
-
-## Networking
-
-- Open the tracking port (default **5000**) in the cloud security group / firewall.
-- Attach the Chameleon **floating IP** to the instance that runs MLflow.
-- Docker on the same VM as MLflow often uses `network_mode: host` (see `docker-compose.yml`) so containers can reach `127.0.0.1:5000`.
-
-## Docker images
-
-From repository root:
+## Build examples
 
 ```bash
-docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -f training/Dockerfile -t tone-train:proj15 ./training
-docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -f training/Dockerfile.llm -t llm-train:proj15 ./training
+docker build -f training/Dockerfile -t tone-train ./training
+docker build -f training/Dockerfile.llm -t llm-train ./training
 ```
 
-## Course submission (Q2)
+## Cluster path
 
-Concrete checklists and file lists: `Q2_COURSE_SUBMISSION.md`, `Q2_2_REPOSITORY_ARTIFACTS.md`, `Q2_1_TRAINING_RUNS_TABLE_FILLED.md`.
+The normal cluster path is:
+
+1. data prepared in `ml-data`
+2. classifier and generator training jobs in `ml-training`
+3. registry job assigns aliases
+4. serving loads models by alias
+
+For current operational usage, prefer the Kubernetes path documented in [k8s/training/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\training\README.md).

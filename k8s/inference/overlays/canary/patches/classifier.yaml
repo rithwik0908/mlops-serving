@@ -1,4 +1,3 @@
-# Canary uses @prod model URI until tone-classifier@canary aliases S3-backed versions (legacy @canary pointed at local MLflow paths).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,18 +11,18 @@ spec:
             - name: DUMMY_MODE
               value: "false"
             - name: CLASSIFIER_MODEL_URI
-              value: "models:/tone-classifier@prod"
+              value: "models:/tone-classifier@canary"
             - name: DEPLOYMENT_TIER
               value: "canary"
-          # MLflow S3 download + PyTorch load often exceed base readiness (15s) — avoid rollout timeout.
+          # Real mode: MLflow + DistilBERT can take many minutes; /ready stays 503 until load completes.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
-            initialDelaySeconds: 90
-            periodSeconds: 10
+            initialDelaySeconds: 5
+            periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 36
+            failureThreshold: 120
           livenessProbe:
             httpGet:
               path: /health

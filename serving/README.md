@@ -1,24 +1,41 @@
-# Serving (tone classifier + generator)
+# Serving
 
-## Quick start
+The serving layer exposes the classifier and tone generator services used by Zulip.
+
+## Main components
+
+- `classifier`: predicts the current tone
+- `generator`: produces `formal`, `friendly`, and `neutral` suggestions
+- `zulip-bridge`: adapts Zulip requests to the generator API
+
+## Local development
 
 ```bash
-cd serving/
+cd serving
 docker compose build
 docker compose up -d classifier-pytorch generator
 ```
 
-Benchmarks and smoke tests live under `evaluate/` and `scripts/`.
+## Cluster deployment
 
-- **Zulip / bot handoff:** [INTEGRATION_FOR_ZULIP.md](./INTEGRATION_FOR_ZULIP.md) — URLs, timeouts, curl examples.
+Cluster deployment is managed by:
 
-## Rubric / ops (serving-owned)
+- [k8s/inference/](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\inference)
+- [k8s/integration/](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\integration)
+- [infra/ansible/playbooks/deploy_ml_workloads.yml](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible\playbooks\deploy_ml_workloads.yml)
 
-- **Runbook:** [OBSERVABILITY_AND_RELEASE.md](./OBSERVABILITY_AND_RELEASE.md) — metrics, model-output checks, feedback handoff, promotion/rollback triggers, E2E boundary.
-- **Dashboards & metrics (team / DevOps — use these only):**  
-  - Grafana: [https://grafana.129.114.27.192.nip.io/](https://grafana.129.114.27.192.nip.io/)  
-  - Prometheus: [https://prometheus.129.114.27.192.nip.io/](https://prometheus.129.114.27.192.nip.io/)  
-  Do not run a separate Grafana or duplicate dashboards for the same cluster; extend the existing dashboards if you need extra panels.
-- **Optional local Prometheus (compose profile `monitoring`):** `prometheus.yml` only for laptop/VM demos without cluster access — not a second “source of truth.”
-- **Alert rule reference (for DevOps to merge):** `alerts/serving.rules.yml` — not loaded by compose by default.
-- **Post-deploy smoke:** `bash scripts/smoke_predict_generate.sh http://127.0.0.1:8001 http://127.0.0.1:8010`
+## Useful docs
+
+- [INTEGRATION_FOR_ZULIP.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\serving\INTEGRATION_FOR_ZULIP.md)
+- [OBSERVABILITY_AND_RELEASE.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\serving\OBSERVABILITY_AND_RELEASE.md)
+- [SERVING_OPTIONS.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\serving\SERVING_OPTIONS.md)
+
+## Quick smoke
+
+```bash
+bash serving/scripts/smoke_predict_generate.sh http://127.0.0.1:8001 http://127.0.0.1:8010
+```
+
+## Current operational note
+
+The generator includes repo-side fallback cleanup logic for weak rewrites. In the cluster, that logic is mounted through the inference ConfigMap path so the repo and running behavior stay aligned.

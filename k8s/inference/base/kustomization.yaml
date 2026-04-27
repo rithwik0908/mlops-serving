@@ -2,6 +2,12 @@
 # Tier-specific names, labels, and env come from overlays/staging|canary|prod.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+configMapGenerator:
+  - name: tone-generator-code
+    options:
+      disableNameSuffixHash: true
+    files:
+      - model.py=generator-model.py
 resources:
   - classifier-pytorch.yaml
   - generator.yaml

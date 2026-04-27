@@ -12,9 +12,9 @@ spec:
   tls:
     - secretName: chameleon-nip-tls
       hosts:
-        - minio-console.129.114.27.192.nip.io
+        - minio-console.FLOATING_IP_PLACEHOLDER.nip.io
   rules:
-    - host: minio-console.129.114.27.192.nip.io
+    - host: minio-console.FLOATING_IP_PLACEHOLDER.nip.io
       http:
         paths:
           - path: /

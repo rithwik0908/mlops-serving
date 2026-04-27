@@ -1,0 +1,86 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  namespace: ml-platform
+  labels:
+    app: backup
+data:
+  upload_file.py: |
+    from __future__ import annotations
+
+    import mimetypes
+    import os
+    import sys
+    from pathlib import Path
+
+    import boto3
+    from botocore.client import Config
+
+
+    def main() -> int:
+        if len(sys.argv) != 3:
+            print("usage: upload_file.py <source-path> <object-key>", file=sys.stderr)
+            return 2
+
+        source_path = Path(sys.argv[1])
+        object_key = sys.argv[2].lstrip("/")
+
+        endpoint = os.environ["OBJECTSTORE_ENDPOINT"]
+        bucket = os.environ["OBJECTSTORE_BUCKET"]
+        prefix = os.environ.get("OBJECTSTORE_PREFIX", "").strip("/")
+        access_key = os.environ["OBJECTSTORE_ACCESS_KEY"]
+        secret_key = os.environ["OBJECTSTORE_SECRET_KEY"]
+        region = os.environ.get("OBJECTSTORE_REGION", "us-east-1")
+
+        full_key = "/".join(part for part in (prefix, object_key) if part)
+        content_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            verify=True,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
+        extra_args = {"ContentType": content_type}
+        client.upload_file(str(source_path), bucket, full_key, ExtraArgs=extra_args)
+        print(f"uploaded {source_path} -> s3://{bucket}/{full_key}")
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+  backup_sqlite.py: |
+    from __future__ import annotations
+
+    import sqlite3
+    import sys
+    from pathlib import Path
+
+
+    def main() -> int:
+        if len(sys.argv) != 3:
+            print("usage: backup_sqlite.py <source-db> <dest-db>", file=sys.stderr)
+            return 2
+
+        source = Path(sys.argv[1])
+        dest = Path(sys.argv[2])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+
+        src_uri = f"file:{source.as_posix()}?mode=ro"
+        with sqlite3.connect(src_uri, uri=True) as src_conn:
+            with sqlite3.connect(dest) as dst_conn:
+                src_conn.backup(dst_conn)
+
+        print(f"sqlite backup complete: {source} -> {dest}")
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())

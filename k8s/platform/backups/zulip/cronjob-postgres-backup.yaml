@@ -1,0 +1,101 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zulip-postgres-backup
+  namespace: zulip
+  labels:
+    app: backup
+    component: postgres
+spec:
+  schedule: "15 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: backup
+            component: postgres
+        spec:
+          nodeSelector:
+            mlops.storage: block
+          restartPolicy: Never
+          volumes:
+            - name: backup-scripts
+              configMap:
+                name: backup-scripts
+                defaultMode: 0555
+          containers:
+            - name: postgres-backup
+              image: postgres:16-alpine
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  apk add --no-cache python3 py3-pip gzip >/dev/null
+                  python3 -m pip install --break-system-packages --no-cache-dir boto3 >/dev/null
+                  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                  OUT="/tmp/zulip-postgres-${TS}.sql.gz"
+                  export PGPASSWORD="${POSTGRES_PASSWORD}"
+                  pg_dump -h "${POSTGRES_HOST}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" | gzip -9 > "${OUT}"
+                  python3 /scripts/upload_file.py "${OUT}" "zulip/postgres/${TS}.sql.gz"
+              env:
+                - name: POSTGRES_HOST
+                  value: "zulip-proj15-postgresql"
+                - name: POSTGRES_DB
+                  value: "zulip"
+                - name: POSTGRES_USER
+                  value: "zulip"
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: zulip-proj15-postgresql
+                      key: password
+                - name: OBJECTSTORE_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: endpoint
+                - name: OBJECTSTORE_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: bucket
+                - name: OBJECTSTORE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: prefix
+                - name: OBJECTSTORE_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: access-key
+                - name: OBJECTSTORE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: secret-key
+                - name: OBJECTSTORE_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: region
+              volumeMounts:
+                - name: backup-scripts
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: 256Mi
+                limits:
+                  cpu: "500m"
+                  memory: 512Mi

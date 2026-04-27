@@ -1,21 +1,34 @@
 ---
 # Installs Helm if missing, then helm upgrade --install for docker-zulip chart.
-# Pass -e zulip_chart_dir=... and values files; see infra/ansible/README.md.
-# Run: ansible-playbook -i ../inventory.ini playbooks/deploy_zulip.yml -e ...
 - name: Deploy Zulip via Helm chart (docker-zulip)
-  hosts: chameleon
+  hosts: control_plane
   become: true
   gather_facts: false
   vars:
     kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
+    repo_root: "/opt/mlops_project"
+    public_floating_ip: "{{ hostvars[groups['control_plane'][0]].ansible_host }}"
+    public_nip_base: "{{ lookup('env', 'PUBLIC_NIP_BASE') | default(public_floating_ip ~ '.nip.io', true) }}"
+    zulip_external_host: "zulip.{{ public_nip_base }}"
     project_id_suffix: "proj15"
     release_name: "zulip-{{ project_id_suffix }}"
     zulip_k8s_namespace: "zulip"
-
-    # Provide at runtime with -e
     zulip_chart_dir: ""
     zulip_values_file: ""
     zulip_secret_values_file: ""
+    zulip_admin_email: "{{ lookup('env', 'ZULIP_ADMIN_EMAIL') | default('admin@example.com', true) }}"
+    zulip_email_host: "{{ lookup('env', 'ZULIP_EMAIL_HOST') | default('localhost', true) }}"
+    zulip_email_host_user: "{{ lookup('env', 'ZULIP_EMAIL_HOST_USER') | default('', true) }}"
+    zulip_email_port: "{{ lookup('env', 'ZULIP_EMAIL_PORT') | default('25', true) }}"
+    zulip_email_use_tls: "{{ lookup('env', 'ZULIP_EMAIL_USE_TLS') | default('False', true) }}"
+    zulip_email_password: "{{ lookup('env', 'ZULIP_EMAIL_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
+    zulip_secret_key: "{{ lookup('env', 'ZULIP_SECRET_KEY') | default(lookup('password', '/dev/null length=48 chars=ascii_letters,digits'), true) }}"
+    zulip_memcached_password: "{{ lookup('env', 'ZULIP_MEMCACHED_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
+    zulip_rabbitmq_password: "{{ lookup('env', 'ZULIP_RABBITMQ_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
+    zulip_rabbitmq_erlang_cookie: "{{ lookup('env', 'ZULIP_RABBITMQ_ERLANG_COOKIE') | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits'), true) }}"
+    zulip_redis_password: "{{ lookup('env', 'ZULIP_REDIS_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
+    zulip_postgres_superuser_password: "{{ lookup('env', 'ZULIP_POSTGRES_SUPERUSER_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
+    zulip_postgres_password: "{{ lookup('env', 'ZULIP_POSTGRES_PASSWORD') | default(lookup('password', '/dev/null length=24 chars=ascii_letters,digits'), true) }}"
   tasks:
     - name: Fail if zulip_chart_dir not provided
       ansible.builtin.fail:
@@ -27,6 +40,22 @@
       register: helm_check
       failed_when: false
       changed_when: false
+
+    - name: Ensure shared manifest renderer directory exists
+      ansible.builtin.file:
+        path: "{{ repo_root }}/k8s/scripts"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copy shared manifest renderer to the VM
+      ansible.builtin.copy:
+        src: "../../../k8s/scripts/render_public_endpoints.py"
+        dest: "{{ repo_root }}/k8s/scripts/render_public_endpoints.py"
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
     - name: Install Helm 3 (upstream install script)
       when: helm_check.rc != 0
@@ -51,7 +80,32 @@
         path: "{{ zulip_chart_dir }}"
       register: zulip_chart_stat
 
-    # Default layout: zulip_chart_dir = /home/<cc>/docker-zulip/helm/zulip — clone parent repo if missing.
+    - name: Ensure parent directory for Zulip secret values exists
+      ansible.builtin.file:
+        path: "{{ zulip_secret_values_file | dirname }}"
+        state: directory
+        mode: "0755"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: zulip_secret_values_file | length > 0
+
+    - name: Check whether Zulip secret values file already exists
+      ansible.builtin.stat:
+        path: "{{ zulip_secret_values_file }}"
+      register: zulip_secret_values_stat
+      when: zulip_secret_values_file | length > 0
+
+    - name: Generate Zulip secret values file when missing
+      ansible.builtin.template:
+        src: "../templates/zulip-values-secret.yaml.j2"
+        dest: "{{ zulip_secret_values_file }}"
+        mode: "0600"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when:
+        - zulip_secret_values_file | length > 0
+        - not zulip_secret_values_stat.stat.exists
+
     - name: Clone docker-zulip chart source (if chart path missing)
       when: not zulip_chart_stat.stat.exists
       become_user: "{{ ansible_user }}"
@@ -60,14 +114,61 @@
         dest: "{{ zulip_chart_dir | dirname | dirname }}"
         depth: 1
 
+    - name: Render shared public nip.io hostnames in Zulip values file
+      ansible.builtin.command: >
+        python3 {{ repo_root }}/k8s/scripts/render_public_endpoints.py
+        --root {{ repo_root }}
+        --base {{ public_nip_base }}
+      when: zulip_values_file | length > 0
+
+    - name: Update SETTING_EXTERNAL_HOST in Zulip secret values
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+
+        path = Path("{{ zulip_secret_values_file }}")
+        data = path.read_bytes()
+        updated = re.sub(
+            br'SETTING_EXTERNAL_HOST:\s*".*"',
+            b'SETTING_EXTERNAL_HOST: "{{ zulip_external_host }}"',
+            data,
+        )
+        if updated != data:
+            path.write_bytes(updated)
+        PY
+      args:
+        executable: /bin/bash
+      when: zulip_secret_values_file | length > 0
+
+    - name: Normalize Zulip secret values file to UTF-8 for Helm
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        from pathlib import Path
+
+        path = Path("{{ zulip_secret_values_file }}")
+        raw = path.read_bytes()
+        for encoding in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            raise RuntimeError(f"Unable to decode {path}")
+        path.write_text(text, encoding="utf-8", newline="\n")
+        PY
+      args:
+        executable: /bin/bash
+      when: zulip_secret_values_file | length > 0
+
     - name: Update chart dependencies
       ansible.builtin.command: helm dependency update {{ zulip_chart_dir }}
 
-    - name: Install/upgrade Zulip chart
+    - name: Install or upgrade Zulip chart
       ansible.builtin.command: >
         helm upgrade --install {{ release_name }} {{ zulip_chart_dir }}
         --namespace {{ zulip_k8s_namespace }}
         --kubeconfig {{ kubeconfig_path }}
         {% if zulip_values_file | length > 0 %}-f {{ zulip_values_file }}{% endif %}
         {% if zulip_secret_values_file | length > 0 %}-f {{ zulip_secret_values_file }}{% endif %}
-

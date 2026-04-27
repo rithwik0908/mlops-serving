@@ -1,46 +1,29 @@
-# training_proj15
+# Training Code
 
-ML training for Chameleon Cloud: **tone classifier** (`training/train.py`) and **LoRA LLM generator** (`training/train_llm.py`). API samples: `samples/`.
+This directory contains the model training code used by the cluster training jobs.
 
-## Quick start
+## Main components
+
+- `training/train.py`: classifier training
+- `training/train_llm.py`: generator training
+- `training/configs/`: config-driven training settings
+- `training/Dockerfile`: classifier training image
+- `training/Dockerfile.llm`: generator training image
+
+## Runtime flow
+
+- training reads prepared data from MinIO
+- runs are logged to MLflow
+- trained models are registered and aliased for serving
+
+## Local build examples
 
 ```bash
-# Tone (sklearn / DistilBERT)
-docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -f training/Dockerfile -t tone-train:proj15 ./training
-export MLFLOW_TRACKING_URI=http://127.0.0.1:5000   # adjust for your setup
-docker run --rm --network host -e MLFLOW_TRACKING_URI tone-train:proj15 --config /app/configs/baseline_tone_nb.yaml
-
-# LLM (LoRA)
-docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" -f training/Dockerfile.llm -t llm-train:proj15 ./training
-docker run --rm --network host -e MLFLOW_TRACKING_URI llm-train:proj15 --config /app/configs/llm_generator_small.yaml
+docker build -f training/Dockerfile -t tone-train ./training
+docker build -f training/Dockerfile.llm -t llm-train ./training
 ```
 
-Compose (Linux / Chameleon): `docker compose -f training/docker-compose.yml build` then `run` services `tone-train` / `llm-train`.
+## Related docs
 
-## Layout
-
-| Path | Content |
-|------|---------|
-| `training/train.py` | Classifier: YAML config, sklearn + optional DistilBERT, Optuna, MLflow |
-| `training/train_llm.py` | Generator: LoRA SFT, MLflow |
-| `training/configs/*.yaml` | Training configurations |
-| `training/Dockerfile` | Classifier image |
-| `training/Dockerfile.llm` | LLM image |
-| `training/Dockerfile.dev` | Dev image (optional) |
-| `training/docker-compose.yml` | `tone-train` + `llm-train`, host network |
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [training/DEPLOYMENT.md](training/DEPLOYMENT.md) | MLflow, firewall, Docker |
-| [training/Q2_COURSE_SUBMISSION.md](training/Q2_COURSE_SUBMISSION.md) | Course Q2 checklist |
-| [training/Q2_2_REPOSITORY_ARTIFACTS.md](training/Q2_2_REPOSITORY_ARTIFACTS.md) | Artifact upload list |
-| [training/Q2_1_TRAINING_RUNS_TABLE_FILLED.md](training/Q2_1_TRAINING_RUNS_TABLE_FILLED.md) | Q2.1 table draft |
-| `DOCS/` | Course PDFs |
-
-## Rubric alignment (summary)
-
-- Training via **Docker** on Chameleon; **MLflow** tracking.
-- **Config-driven** (`train.py` / `train_llm.py` + YAML); **Optuna** where enabled for sklearn.
-- Submission details: `Q2_COURSE_SUBMISSION.md`.
+- [training/DEPLOYMENT.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\training_proj15-main\training\DEPLOYMENT.md)
+- [../k8s/training/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\training\README.md)

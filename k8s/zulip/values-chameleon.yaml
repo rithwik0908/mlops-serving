@@ -32,32 +32,37 @@ zulip:
 service:
   type: ClusterIP
 
+nodeSelector:
+  mlops.storage: "block"
+
 # Host MUST match zulip.environment.SETTING_EXTERNAL_HOST in values-secret.yaml.
 # TLS: create Secret `chameleon-nip-tls` in namespace `zulip` (see RUNBOOK_zulip_access_after_setup.md).
 ingress:
   enabled: true
   className: traefik
   hosts:
-    - host: zulip.129.114.27.192.nip.io
+    - host: zulip.FLOATING_IP_PLACEHOLDER.nip.io
       paths:
         - path: /
   tls:
     - secretName: chameleon-nip-tls
       hosts:
-        - zulip.129.114.27.192.nip.io
+        - zulip.FLOATING_IP_PLACEHOLDER.nip.io
 
 # Main Zulip container (chart root key — not under zulip:). Sized from kubectl top (~4.3 GiB RSS light load; ~196 m CPU busier).
 # Requests lowered for small clusters; raise memory if you see OOMKill under real load.
 resources:
   requests:
     cpu: 500m
-    memory: 5Gi
+    memory: 6Gi
   limits:
     cpu: "2"
     memory: 8Gi
 
 postgresql:
   primary:
+    nodeSelector:
+      mlops.storage: "block"
     persistence:
       storageClass: "local-path"
       size: "15Gi"
@@ -102,7 +107,7 @@ image:
 
 # --- Smokescreen egress (required for compose "Tone suggestions") ---
 # Django outbound HTTP goes through Smokescreen. In-cluster URLs (e.g. zulip-bridge) resolve to
-# private IPs (pod net + often a separate Service CIDR). Without --allow-address, Smokescreen
+# private IPs (pod net + often a separate Service CIDR). Without allowing those ranges, Smokescreen
 # returns HTTP 407; the UI shows: "Tone service returned an error (407)." while curl from the
 # pod (bypassing Smokescreen) still returns 200. This post-setup hook patches smokescreen once.
 # If your cluster uses different CIDRs, run from a pod: getent hosts zulip-bridge.ml-serving.svc.cluster.local
@@ -114,8 +119,8 @@ postSetup:
       set -euo pipefail
       CONF=/etc/supervisor/conf.d/zulip/smokescreen.conf
       test -f "$CONF" || exit 0
-      if grep -q "allow-address 10.42.0.0/16" "$CONF"; then
+      if grep -q "allow-range 10.42.0.0/16" "$CONF"; then
         exit 0
       fi
-      sed -ri '/smokescreen/s|(command=.*)|\1 --allow-address 10.42.0.0/16 --allow-address 10.43.0.0/16|' "$CONF"
+      sed -ri '/smokescreen/s|(command=.*)|\1 --allow-range 10.42.0.0/16 --allow-range 10.43.0.0/16|' "$CONF"
       supervisorctl restart smokescreen 2>/dev/null || true

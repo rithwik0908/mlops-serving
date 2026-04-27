@@ -17,6 +17,10 @@ spec:
       app: zulip-bridge
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: "/metrics"
       labels:
         app: zulip-bridge
         role: integration

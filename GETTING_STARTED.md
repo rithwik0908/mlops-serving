@@ -1,279 +1,199 @@
-# Getting started
+# Getting Started
 
-This guide describes **what this repository implements** and **how to run it end-to-end** with concrete commands. For a diagram and layer breakdown, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For secret-handling rules, see [`SECURITY.md`](SECURITY.md).
+This guide describes the recommended bring-up and rerun flow for the current repository state.
 
----
+## Prerequisites
 
-## Table of contents
+- Chameleon leases for one control-plane node and one worker node
+- OpenStack application credentials
+- A floating IP
+- Terraform installed on Windows or Linux
+- WSL or Linux shell with Ansible in `infra/ansible/.venv`
+- SSH key available to both Terraform and Ansible
 
-1. [What this project delivers](#1-what-this-project-delivers)
-2. [Prerequisites](#2-prerequisites)
-3. [Repository layout (operational)](#3-repository-layout-operational)
-4. [Local files you must create (never commit)](#4-local-files-you-must-create-never-commit)
-5. [Step 1 — Align Kubernetes manifests with your environment](#5-step-1--align-kubernetes-manifests-with-your-environment)
-6. [Step 2 — Provision the VM with Terraform](#6-step-2--provision-the-vm-with-terraform)
-7. [Step 3 — Ansible inventory](#7-step-3--ansible-inventory)
-8. [Step 4 — Install k3s](#8-step-4--install-k3s)
-9. [Step 5 — Deploy namespaces, MLflow, MinIO, and observability](#9-step-5--deploy-namespaces-mlflow-minio-and-observability)
-10. [Step 6 — TLS Secret for Ingress (Traefik)](#10-step-6--tls-secret-for-ingress-traefik)
-11. [Step 7 — Prepare Zulip Helm values (secrets)](#11-step-7--prepare-zulip-helm-values-secrets)
-12. [Step 8 — Deploy Zulip with Ansible + Helm](#12-step-8--deploy-zulip-with-ansible--helm)
-13. [Step 9 — Verify](#13-step-9--verify)
-14. [Operational notes](#14-operational-notes)
-15. [Troubleshooting](#15-troubleshooting)
+## Local files you need
 
----
+- `infra/terraform/openstack/terraform.tfvars`
+- `infra/ansible/inventory.ini`
 
-## 1. What this project delivers
+Do not commit any of those files.
 
-| Capability | Implementation |
-|------------|----------------|
-| Cloud VM + networking | Terraform in `infra/terraform/openstack/` |
-| Single-node Kubernetes | **k3s** via `infra/ansible/playbooks/k3s_install.yml` |
-| Ingress + HTTPS (demo) | k3s default **Traefik**; TLS Secret `chameleon-nip-tls` |
-| Experiment tracking | **MLflow** in namespace `ml-platform` (`k8s/platform/mlflow/`) |
-| Object storage (S3 API) | **MinIO** in namespace `ml-platform` (`k8s/platform/minio/`) |
-| Metrics + dashboards + alerting | **Prometheus** + **Grafana** + **Alertmanager** in namespace `monitoring` (`k8s/platform/observability/`) |
-| Team chat (base product) | **Zulip** from [docker-zulip](https://github.com/zulip/docker-zulip) Helm chart, values under `k8s/zulip/` |
+## Recommended commands
 
-Traffic flow: **Internet → floating IP :443 → Traefik → Ingress rules → MLflow, MinIO (API + console), Grafana, Prometheus (optional Ingress), and Zulip Services.**
-
----
-
-## 2. Prerequisites
-
-- **Chameleon Cloud** project, lease/reservation, and an Ubuntu image (e.g. `CC-Ubuntu24.04`) on `KVM@TACC`. **Project 15 system integration lease** (`System_Integration_proj15`) is **ACTIVE**; reservation id and `openstack_tenant_id` are set in [`infra/terraform/openstack/terraform.tfvars.example`](infra/terraform/openstack/terraform.tfvars.example) — copy to private `terraform.tfvars`, set **`key_pair`** and **`network_id`**, add application credentials, then run Terraform.
-- **OpenStack access**: application credential (recommended) or username/password; see `infra/terraform/openstack/providers.tf` comments.
-- **Tools on your workstation** (Linux, WSL2, or macOS recommended):
-  - Terraform ≥ 1.x
-  - `ansible-core` in a **dedicated Python venv** (avoid broken Conda mixes)
-  - `ssh`, `git`
-- **OpenStack security groups**: allow **TCP 22** (SSH), **80** and **443** (HTTP/HTTPS for Ingress and ACME if used later).
-
----
-
-## 3. Repository layout (operational)
-
-| Path | Role |
-|------|------|
-| `infra/terraform/openstack/` | VM, network, floating IP |
-| `infra/ansible/playbooks/k3s_install.yml` | Install k3s |
-| `infra/ansible/playbooks/deploy_platform.yml` | Copy `k8s/` to VM; apply namespaces + MLflow + MinIO + Prometheus/Grafana |
-| `infra/ansible/playbooks/deploy_zulip.yml` | Helm install/upgrade Zulip on the cluster |
-| `k8s/base/namespaces.yaml` | `zulip`, `ml-platform`, teammate namespaces |
-| `k8s/platform/mlflow/` | MLflow Deployment, PVC, Service, Ingress (Kustomize) |
-| `k8s/platform/minio/` | MinIO Deployment, PVC, Service, API + console Ingresses (Kustomize) |
-| `k8s/platform/observability/` | Prometheus + Grafana + Alertmanager (PVCs, RBAC, alert rules, Grafana Ingress) |
-| `k8s/zulip/values-chameleon.yaml` | Non-secret Helm overrides (Ingress, storage class, proxy) |
-| `k8s/zulip/values-secret.yaml.example` | Template for **local** `values-secret.yaml` (gitignored) |
-
----
-
-## 4. Local files you must create (never commit)
-
-| File | Purpose |
-|------|---------|
-| `infra/terraform/openstack/terraform.tfvars` | Real OpenStack IDs, reservation, keypair name (copy from `terraform.tfvars.example`) |
-| `infra/ansible/inventory.ini` | VM floating IP + SSH key path (copy from `inventory.example.ini`) |
-| `~/values-secret.yaml` **on the VM** | Zulip DB passwords, `SECRETS_secret_key`, `SETTING_EXTERNAL_HOST`, etc. |
-
-These paths are listed in `.gitignore` / `SECURITY.md`. Do not paste credentials into issues or commits.
-
----
-
-## 5. Step 1 — Align Kubernetes manifests with your environment
-
-Tracked YAML uses a **placeholder floating IP** (e.g. RFC 5737 documentation addresses in examples). Before you apply manifests or generate TLS certs, replace it with **your** Chameleon floating IP everywhere it appears:
-
-- `k8s/zulip/values-chameleon.yaml` — Ingress `host` / TLS `hosts`
-- `k8s/platform/mlflow/ingress.yaml` — rules and TLS `hosts`
-- `k8s/platform/minio/ingress-api.yaml` and `ingress-console.yaml` — API and console hosts / TLS `hosts`
-- `k8s/platform/minio/deployment.yaml` — `MINIO_SERVER_URL` and `MINIO_BROWSER_REDIRECT_URL` (must match those Ingress URLs)
-- `k8s/platform/observability/ingress-grafana.yaml` — Grafana host / TLS `hosts`
-- `k8s/platform/observability/ingress-prometheus.yaml` — Prometheus host / TLS `hosts` (if used)
-- `k8s/platform/observability/deployment-grafana.yaml` — `GF_SERVER_ROOT_URL` (must match Ingress URL)
-
-Use a consistent hostname pattern, e.g.:
-
-- Zulip: `zulip.<YOUR_FLOATING_IP>.nip.io`
-- MLflow: `mlflow.<YOUR_FLOATING_IP>.nip.io`
-- MinIO API: `minio.<YOUR_FLOATING_IP>.nip.io`
-- MinIO console: `minio-console.<YOUR_FLOATING_IP>.nip.io`
-- Grafana: `grafana.<YOUR_FLOATING_IP>.nip.io`
-- Prometheus (optional): `prometheus.<YOUR_FLOATING_IP>.nip.io`
-
-Commit or keep these edits local according to your policy; **never** commit secrets.
-
----
-
-## 6. Step 2 — Provision the VM with Terraform
+For a clean bring-up from the repo root:
 
 ```bash
-cd infra/terraform/openstack
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: network_id, key_pair, blazar_reservation_id (if used), etc.
+./infra/run-terraform --action apply --write-inventory
+./infra/run-ansible
 ```
 
-Authenticate with **one** of: variables in `terraform.tfvars`, or environment variables. Example for **application credentials** (PowerShell):
+For a normal rerun on an existing live cluster:
 
-```powershell
-$env:OS_AUTH_URL = "https://kvm.tacc.chameleoncloud.org:5000/v3"
-$env:OS_REGION_NAME = "KVM@TACC"
-$env:OS_INTERFACE = "public"
-$env:OS_IDENTITY_API_VERSION = "3"
-$env:OS_AUTH_TYPE = "v3applicationcredential"
-$env:OS_APPLICATION_CREDENTIAL_ID = "<id>"
-$env:OS_APPLICATION_CREDENTIAL_SECRET = "<secret>"
-$env:TF_VAR_application_credential_id = "<id>"
-$env:TF_VAR_application_credential_secret = "<secret>"
+```bash
+./infra/run-ansible --skip-pvc-migration
 ```
 
-Equivalent exports work in Bash. Then:
+Use the playbook-by-playbook flow below when you need to debug or run individual stages.
+
+## Bring-up order
+
+### 1. Provision infrastructure
+
+From [infra/terraform/openstack](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\terraform\openstack):
 
 ```bash
 terraform init
 terraform plan
 terraform apply
-terraform output
-# Optional: stub for Ansible inventory
 terraform output -raw ansible_inventory_ini
 ```
 
-Record the **floating IP** from outputs for DNS/nip.io names and `inventory.ini`.
+Copy the generated inventory into [infra/ansible/inventory.ini](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible\inventory.ini) and add your SSH key path if needed.
 
----
+### 2. Install k3s
 
-## 7. Step 3 — Ansible inventory
-
-From `infra/ansible/`:
+From [infra/ansible](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible):
 
 ```bash
-cp inventory.example.ini inventory.ini
-```
-
-Edit `inventory.ini`:
-
-```ini
-[chameleon]
-<YOUR_FLOATING_IP>
-
-[chameleon:vars]
-ansible_user=cc
-ansible_ssh_private_key_file=~/.ssh/<your-private-key>
-```
-
-**WSL note:** if the key lives under `/mnt/c/...`, copy it to `~/.ssh/` and `chmod 600`; OpenSSH often rejects world-readable Windows-mounted keys.
-
----
-
-## 8. Step 4 — Install k3s
-
-Use a venv with `ansible-core` installed, then:
-
-```bash
-cd infra/ansible
+source .venv/bin/activate
 ansible-playbook -i inventory.ini playbooks/k3s_install.yml
 ```
 
-k3s writes kubeconfig to `/etc/rancher/k3s/k3s.yaml` on the VM; the playbook copies it to `/home/cc/.kube/config` for user `cc`.
+This installs k3s server on the control-plane and joins the worker through the control-plane jump host.
 
----
-
-## 9. Step 5 — Deploy namespaces, MLflow, MinIO, and observability
+### 3. Install Sealed Secrets and bootstrap runtime secrets
 
 ```bash
-cd infra/ansible
+ansible-playbook -i inventory.ini playbooks/deploy_sealed_secrets.yml
+```
+
+This installs the Sealed Secrets controller and bootstraps the required runtime secrets.
+
+By default it will:
+
+- create `minio-root` in the runtime namespaces
+- create `grafana-admin` in `monitoring`
+- generate a self-signed `chameleon-nip-tls` certificate for the current `*.nip.io` hosts
+- create the TLS secret in `zulip`, `ml-platform`, `monitoring`, and `ml-serving`
+
+Optional:
+
+- if you set `CHAMELEON_TLS_CERT_FILE` and `CHAMELEON_TLS_KEY_FILE` in the local shell,
+  those files will be used instead of generating a self-signed certificate
+- if you set `APPLY_STATIC_SEALED_SECRETS=true`, the playbook will also apply the static
+  manifests from [k8s/secrets](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\secrets)
+
+### 4. Prepare block storage for persistent state
+
+If you attached a Chameleon block volume for persistent service data, prepare it on the
+control-plane before deploying workloads:
+
+```bash
+ansible-playbook -i inventory.ini playbooks/prepare_block_storage.yml
+```
+
+This playbook:
+
+- persists the `/mnt/block` mount in `/etc/fstab`
+- creates service directories under `/mnt/block`
+- labels the control-plane node as the block-backed storage node
+- updates k3s `local-path` so new claims scheduled on the control-plane use the block volume
+
+Important:
+
+- the playbook expects the attached partition to be `/dev/vdb1`
+- existing PVCs are not migrated automatically; only newly provisioned or recreated claims will move
+
+If the platform services already exist and you want to move their current PVC contents to
+the block-backed path, run the migration after the next platform apply:
+
+```bash
+ansible-playbook -i inventory.ini playbooks/migrate_platform_pvcs_to_block.yml
+```
+
+This migrates:
+
+- MinIO
+- MLflow
+- Prometheus
+- Grafana
+
+The migration is serialized and service-by-service: scale down, stream backup, recreate
+the PVC, restore, then scale back up.
+
+This is a one-time disruptive migration step. Do not include it in normal reruns of the
+cluster after the data has already been moved.
+
+### 5. Deploy the shared platform
+
+```bash
 ansible-playbook -i inventory.ini playbooks/deploy_platform.yml
 ```
 
-This copies `k8s/` to `/opt/mlops_project/k8s/` on the VM and runs:
+This deploys:
 
-- `kubectl apply -f .../k8s/base/namespaces.yaml`
-- `kubectl apply -k .../k8s/platform/mlflow/`
-- Creates Secret **`minio-root`** in **`ml-platform`** if it does not exist (`root-user=minioadmin`, random `root-password`).
-- `kubectl apply -k .../k8s/platform/minio/`
-- Creates Secret **`grafana-admin`** in **`monitoring`** if it does not exist (random password).
-- `kubectl apply -k .../k8s/platform/observability/`
+- namespaces
+- MLflow
+- MinIO
+- Prometheus
+- Grafana
+- Alertmanager
 
-**MinIO credentials** (after first apply):
+The playbook also rewrites `*.nip.io` hostnames in the synced VM manifests to the current floating IP.
+
+### 6. Deploy automated backups to Chameleon object storage
+
+Export the object-storage values in the local shell that will run Ansible:
 
 ```bash
-kubectl get secret minio-root -n ml-platform -o jsonpath='{.data.root-user}' | base64 -d && echo
-kubectl get secret minio-root -n ml-platform -o jsonpath='{.data.root-password}' | base64 -d && echo
+export CHAMELEON_OBJECTSTORE_BUCKET=<your-object-store-container>
+export CHAMELEON_OBJECTSTORE_ACCESS_KEY=<your-ec2-access-key>
+export CHAMELEON_OBJECTSTORE_SECRET_KEY=<your-ec2-secret-key>
+export CHAMELEON_OBJECTSTORE_ENDPOINT=https://chi.tacc.chameleoncloud.org:7480
+export CHAMELEON_OBJECTSTORE_PREFIX=proj15-backups
 ```
 
-**Grafana password** (after first apply):
+Then deploy the backup CronJobs:
 
 ```bash
-kubectl get secret grafana-admin -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d && echo
+ansible-playbook -i inventory.ini playbooks/deploy_backups.yml
 ```
 
-**Idempotency:** if you also create the same namespaces with Terraform (`infra/terraform/k8s-apps/`), use **one** mechanism only to avoid drift.
+This creates `chameleon-objectstore-backup` in `zulip`, `ml-platform`, and `monitoring`,
+then applies scheduled backups for:
 
----
+- Zulip PostgreSQL
+- Zulip app data
+- MLflow SQLite metadata
+- MinIO bucket contents
+- Grafana SQLite metadata
+- Prometheus TSDB snapshots
 
-## 10. Step 6 — TLS Secret for Ingress (Traefik)
+### 7. Deploy Zulip
 
-Ingress manifests reference TLS Secret name **`chameleon-nip-tls`** in namespaces **`zulip`**, **`ml-platform`**, and **`monitoring`**. Create a certificate whose **SAN** includes every public hostname (replace `<YOUR_FLOATING_IP>`):
+If `/home/cc/values-secret.yaml` does not already exist, the playbook will generate it
+automatically using:
 
-```bash
-# Run on any host with openssl; adjust Subject Alternative Names to match your Ingress hosts.
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-  -keyout tls.key -out tls.crt \
-  -subj "/CN=zulip.<YOUR_FLOATING_IP>.nip.io" \
-  -addext "subjectAltName=DNS:zulip.<YOUR_FLOATING_IP>.nip.io,DNS:mlflow.<YOUR_FLOATING_IP>.nip.io,DNS:minio.<YOUR_FLOATING_IP>.nip.io,DNS:minio-console.<YOUR_FLOATING_IP>.nip.io,DNS:grafana.<YOUR_FLOATING_IP>.nip.io,DNS:prometheus.<YOUR_FLOATING_IP>.nip.io"
-```
+- environment variables when provided
+- otherwise sensible defaults plus random passwords/secrets
 
-Load the Secret (run where `kubectl` uses the cluster kubeconfig, e.g. on the VM as `cc`):
+Useful optional environment variables:
 
-```bash
-export KUBECONFIG=$HOME/.kube/config
-
-kubectl create secret tls chameleon-nip-tls -n zulip \
-  --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl create secret tls chameleon-nip-tls -n ml-platform \
-  --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl create secret tls chameleon-nip-tls -n monitoring \
-  --cert=tls.crt --key=tls.key --dry-run=client -o yaml | kubectl apply -f -
-```
-
-Self-signed certificates will show browser warnings until trusted or replaced (e.g. Let’s Encrypt + cert-manager).
-
----
-
-## 11. Step 7 — Prepare Zulip Helm values (secrets)
-
-On the **VM** as `cc`:
+- `ZULIP_ADMIN_EMAIL`
+- `ZULIP_EMAIL_HOST`
+- `ZULIP_EMAIL_HOST_USER`
+- `ZULIP_EMAIL_PORT`
+- `ZULIP_EMAIL_USE_TLS`
+- `ZULIP_EMAIL_PASSWORD`
+- `ZULIP_SECRET_KEY`
+- `ZULIP_MEMCACHED_PASSWORD`
+- `ZULIP_RABBITMQ_PASSWORD`
+- `ZULIP_RABBITMQ_ERLANG_COOKIE`
+- `ZULIP_REDIS_PASSWORD`
+- `ZULIP_POSTGRES_SUPERUSER_PASSWORD`
+- `ZULIP_POSTGRES_PASSWORD`
 
 ```bash
-git clone --depth 1 https://github.com/zulip/docker-zulip.git ~/docker-zulip
-
-cp ~/docker-zulip/helm/zulip/values-local.yaml.example ~/values-secret.yaml
-# Or, after deploy_platform:
-# cp /opt/mlops_project/k8s/zulip/values-secret.yaml.example ~/values-secret.yaml
-
-nano ~/values-secret.yaml
-```
-
-**Minimum alignment:**
-
-- `SETTING_EXTERNAL_HOST` must **exactly match** the Zulip Ingress host (e.g. `zulip.<YOUR_FLOATING_IP>.nip.io`).
-- Set strong values for `SECRETS_secret_key`, database passwords, etc. (quote numeric-looking passwords as YAML strings).
-- If Helm merges drop proxy settings, ensure **`LOADBALANCER_IPS`** (e.g. k3s pod CIDR `10.42.0.0/16`) reaches the Zulip pod env — see `k8s/zulip/values-chameleon.yaml` comments.
-
-Never commit `~/values-secret.yaml`.
-
----
-
-## 12. Step 8 — Deploy Zulip with Ansible + Helm
-
-From your **workstation** (paths below are **on the VM**):
-
-```bash
-cd infra/ansible
-
 ansible-playbook -i inventory.ini playbooks/deploy_zulip.yml \
   -e zulip_chart_dir=/home/cc/docker-zulip/helm/zulip \
   -e project_id_suffix=proj15 \
@@ -281,76 +201,72 @@ ansible-playbook -i inventory.ini playbooks/deploy_zulip.yml \
   -e zulip_secret_values_file=/home/cc/values-secret.yaml
 ```
 
-Adjust `zulip_chart_dir` if you cloned docker-zulip elsewhere. The playbook runs `helm dependency update` and `helm upgrade --install`.
-
-**Compose “Tone suggestions”:** tracked `values-chameleon.yaml` sets `TONE_MLOPS_BRIDGE_URL` to the in-cluster bridge. You still need a **custom Zulip server image** from the fork under `integrations/zulip-server-mlops/` (see that README). After changing bridge URL or tone settings, re-run this Helm upgrade so the Zulip pod picks up `ZULIP_CUSTOM_SETTINGS`.
-
-**Manual Helm equivalent** (on the VM), after `helm dependency update` inside the chart directory:
+### 8. Deploy ML workloads
 
 ```bash
-helm upgrade --install zulip-proj15 /home/cc/docker-zulip/helm/zulip \
-  --namespace zulip \
-  --kubeconfig "$HOME/.kube/config" \
-  -f /opt/mlops_project/k8s/zulip/values-chameleon.yaml \
-  -f "$HOME/values-secret.yaml"
+ansible-playbook -i inventory.ini playbooks/deploy_ml_workloads.yml
 ```
 
----
+The playbook now:
 
-## 13. Step 9 — Verify
+- syncs the current `k8s/` tree to the VM
+- rewrites public hostnames to the active floating IP
+- verifies `minio-root` is present in workload namespaces
+- runs the data jobs and waits for them
+- applies inference and bridge manifests and waits for rollouts
+- runs training jobs and waits for them
+- runs the registry job and waits for completion
 
-On the VM (or with `KUBECONFIG` pointing at the cluster):
+## Verification checklist
+
+On the control-plane VM:
 
 ```bash
 kubectl get nodes
-kubectl get ns
 kubectl get pods,svc,ingress -n ml-platform
 kubectl get pods,svc,ingress -n monitoring
 kubectl get pods,svc,ingress -n zulip
+kubectl get cronjobs,jobs -n ml-platform
+kubectl get cronjobs,jobs -n monitoring
+kubectl get cronjobs,jobs -n zulip
 kubectl get pods,svc -n ml-data
 kubectl get pods,svc -n ml-serving
 kubectl get jobs,pods -n ml-training
 ```
 
-**Smoke tests:**
+Expected high-level state:
 
-```bash
-curl -skI -H "Host: zulip.<YOUR_FLOATING_IP>.nip.io" "https://<YOUR_FLOATING_IP>/"
-curl -skI -H "Host: mlflow.<YOUR_FLOATING_IP>.nip.io" "https://<YOUR_FLOATING_IP>/"
-curl -skI -H "Host: grafana.<YOUR_FLOATING_IP>.nip.io" "https://<YOUR_FLOATING_IP>/"
-curl -skI -H "Host: minio.<YOUR_FLOATING_IP>.nip.io" "https://<YOUR_FLOATING_IP>/"
-curl -skI -H "Host: minio-console.<YOUR_FLOATING_IP>.nip.io" "https://<YOUR_FLOATING_IP>/"
-```
+- both nodes `Ready`
+- platform pods `Running`
+- Zulip pods `Running`
+- data jobs `Complete`
+- training jobs `Complete`
+- `register-and-alias-latest` `Complete`
+- classifier and generator deployments ready in `staging`, `canary`, and `prod`
 
-**Browser:** `https://zulip.<YOUR_FLOATING_IP>.nip.io/`, `https://mlflow.<YOUR_FLOATING_IP>.nip.io/`, `https://minio-console.<YOUR_FLOATING_IP>.nip.io/` (MinIO console; user from `minio-root` Secret), `https://grafana.<YOUR_FLOATING_IP>.nip.io/` (log in with `admin` and the `grafana-admin` Secret password), and optionally `https://prometheus.<YOUR_FLOATING_IP>.nip.io/` — accept cert warning if self-signed.
+## Browser checks
 
-If **`/new/`** org creation is enabled, ensure `SETTING_OPEN_REALM_CREATION` is set consistently in values files and recycle the Zulip pod after `helm upgrade` when changing env.
+Verify:
 
----
+- `https://zulip.<floating-ip>.nip.io`
+- `https://mlflow.<floating-ip>.nip.io`
+- `https://minio-console.<floating-ip>.nip.io`
+- `https://grafana.<floating-ip>.nip.io`
 
-## 14. Operational notes
+Then log into Zulip and test `Tone suggestions`.
 
-- **One platform policy:** Use a single MLflow, MinIO, and Prometheus/Grafana stack; know who runs `deploy_platform.yml` vs `deploy_ml_workloads.yml`; clean up duplicate OpenStack and Kubernetes resources before submission. Details: [`infra/ONE_PLATFORM_AND_CLEANUP.md`](infra/ONE_PLATFORM_AND_CLEANUP.md).
-- **Traefik** is the default k3s ingress controller; `ingressClassName: traefik` is set on MLflow, MinIO, Grafana, Prometheus (if exposed), and Zulip Ingresses.
-- **Prometheus/Grafana/Alertmanager:** Prometheus scrapes pods annotated with `prometheus.io/scrape: "true"` (for example inference in `ml-serving`). Evaluated alert rules forward to Alertmanager (configure webhook in `k8s/platform/observability/configmap-alertmanager.yaml`). Use Grafana’s Explore or dashboards; Prometheus Ingress is optional.
-- **Storage:** examples target k3s **`local-path`**; change `storageClassName` / Helm values if your cluster uses another provisioner.
-- **Optional path:** `infra/terraform/k8s-apps/` can manage some Kubernetes resources with Terraform; this is optional and orthogonal to the Ansible flow above.
-- **`zulip/` submodule:** upstream source reference only; runtime uses published images via the docker-zulip chart.
+Grafana also includes a `Data Monitoring and Quality` dashboard that shows:
 
----
+- bridge feedback counters
+- feature-log activity
+- data and training job health
+- data and training pod restarts
 
-## 15. Troubleshooting
+Some bridge-related panels require at least one successful Prometheus scrape interval after
+live traffic has hit the bridge metrics endpoint.
 
-| Symptom | Typical cause | Action |
-|--------|----------------|--------|
-| Ansible `ModuleNotFoundError: ...six.moves` | Broken / mixed Ansible install | New venv; `pip install ansible-core`; see `infra/ansible/README.md` |
-| SSH “permissions too open” for `.pem` | Key on `/mnt/c/` (WSL) | Copy key to `~/.ssh`, `chmod 600` |
-| Traefik **404** for Zulip | `Host` header / `SETTING_EXTERNAL_HOST` mismatch | Align Ingress host, secret `SETTING_EXTERNAL_HOST`, and browser URL (`zulip.<ip>.nip.io`) |
-| Zulip **ProxyMisconfigurationError** | Traefik not trusted | Set **`LOADBALANCER_IPS`** to pod CIDR; confirm in pod env and `zulip.conf`; `helm upgrade` + pod restart |
-| HTTPS timeout | Security group | Allow **443** (and **80** if needed) on the floating IP |
-| Helm merge dropped env | Multiple `-f` files | Put critical env in the file that wins the merge or duplicate in `values-secret.yaml` as documented in chart comments |
-| Grafana **CrashLoop** / secret missing | `grafana-admin` not created | Run deploy_platform (bootstrap task) or `kubectl create secret generic grafana-admin ...` before `apply -k observability` |
-| Grafana login fails | Wrong password | `kubectl get secret grafana-admin -n monitoring -o jsonpath='{.data.admin-password}' \| base64 -d` |
-| MinIO **CreateContainerConfigError** | `minio-root` missing | Run deploy_platform (bootstrap task) or create `minio-root` with keys `root-user` and `root-password` before pods schedule |
+## If something fails
 
-For deeper Ansible-only detail, see [`infra/ansible/README.md`](infra/ansible/README.md). For Zulip chart specifics, see [`k8s/zulip/README.md`](k8s/zulip/README.md). Observability manifests: [`k8s/platform/observability/README.md`](k8s/platform/observability/README.md).
+- Platform issues: see [infra/ansible/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible\README.md)
+- Kubernetes manifest ownership and layout: see [k8s/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\k8s\README.md)
+- Serving and integration checks: see [serving/README.md](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\serving\README.md)

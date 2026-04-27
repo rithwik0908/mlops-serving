@@ -4,15 +4,48 @@
   "variants": {
     "formal": {
       "text": "Could you please address the bug at your earliest convenience? It has been unresolved for three days now.",
-      "confidence": 0.91
+      "confidence": 0.91,
+      "source": "model",
+      "fallback_reason": null,
+      "quality_flags": []
     },
     "friendly": {
       "text": "Hey! Just checking in — the bug has been open for three days. Would you be able to take a look soon? Thanks!",
-      "confidence": 0.87
+      "confidence": 0.87,
+      "source": "fallback",
+      "fallback_reason": "near_copy",
+      "quality_flags": ["near_copy"]
     },
     "neutral": {
       "text": "The bug has been open for three days. Please fix it when you can.",
-      "confidence": 0.83
+      "confidence": 0.83,
+      "source": "model",
+      "fallback_reason": null,
+      "quality_flags": []
+    }
+  },
+  "generation_diagnostics": {
+    "request_path": "mixed_fallback",
+    "fallback_variant_count": 1,
+    "model_variant_count": 2,
+    "queue_wait_ms": 18.4,
+    "latency_budget_exceeded": false,
+    "variant_diagnostics": {
+      "formal": {
+        "source": "model",
+        "fallback_reason": null,
+        "quality_flags": []
+      },
+      "friendly": {
+        "source": "fallback",
+        "fallback_reason": "near_copy",
+        "quality_flags": ["near_copy"]
+      },
+      "neutral": {
+        "source": "model",
+        "fallback_reason": null,
+        "quality_flags": []
+      }
     }
   },
   "offensive_content_flagged": false,

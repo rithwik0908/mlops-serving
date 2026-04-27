@@ -3,8 +3,9 @@
 #   A) workflow_run: fires after build-push-ml-images succeeds on main — guarantees images
 #      exist in GHCR before apply.
 #   B) workflow_dispatch: manual trigger (e.g. re-deploy without a new image build).
-#   C) push to main when only k8s/inference/** or serving/ manifests change (no new image,
-#      but config / resource limits updated).
+#   C) push to main when manifests change without requiring a fresh image build
+#      (config / resource limit updates only). If the same commit also touched build inputs,
+#      this workflow stands down and waits for the workflow_run trigger after images are pushed.
 #
 # Requires:
 #   KUBE_CONFIG_B64 — base64-encoded kubeconfig with rights to ml-serving namespace.
@@ -30,12 +31,58 @@ permissions:
   contents: read
 
 jobs:
-  deploy-staging:
+  classify-trigger:
     # For workflow_run trigger, only run if the upstream build succeeded.
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      skip_deploy: ${{ steps.classify.outputs.skip_deploy }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Classify staging deploy trigger
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          skip_deploy=false
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              changed_files="$(git diff --name-only "$PUSH_BEFORE" "$PUSH_AFTER")"
+            else
+              changed_files="$(git diff-tree --no-commit-id --name-only -r "$PUSH_AFTER")"
+            fi
+
+            echo "Changed files in push:"
+            printf '%s\n' "$changed_files"
+
+            if printf '%s\n' "$changed_files" | grep -Eq '^(data/|serving/|training_proj15-main/training/|integrations/zulip-bridge/|\.github/workflows/build-push-ml-images\.yml$)'; then
+              skip_deploy=true
+              echo "::notice::Push also changed image-build inputs. Skipping the immediate staging deploy and waiting for the workflow_run trigger after Build and push ML images succeeds."
+            fi
+          fi
+
+          echo "skip_deploy=$skip_deploy" >> "$GITHUB_OUTPUT"
+
+  deploy-staging:
+    needs: classify-trigger
+    if: ${{ needs.classify-trigger.outputs.skip_deploy != 'true' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-serving-staging-${{ github.event.workflow_run.head_branch || github.ref_name || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -52,26 +99,79 @@ jobs:
           echo "$KUBE_CONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
           chmod 600 "$RUNNER_TEMP/kubeconfig"
 
+      - name: Tunnel Kubernetes API over SSH
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          CONTROL_PLANE_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          CONTROL_PLANE_USER: ${{ vars.CONTROL_PLANE_USER }}
+          CONTROL_PLANE_SSH_KEY: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTROL_PLANE_HOST:-}" ] || [ -z "${CONTROL_PLANE_USER:-}" ]; then
+            echo "::error::Missing Actions variables CONTROL_PLANE_HOST and/or CONTROL_PLANE_USER."
+            exit 1
+          fi
+          if [ -z "${CONTROL_PLANE_SSH_KEY:-}" ]; then
+            echo "::error::Missing repository secret CONTROL_PLANE_SSH_KEY."
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CONTROL_PLANE_SSH_KEY" > ~/.ssh/control_plane_key
+          chmod 600 ~/.ssh/control_plane_key
+          ssh-keyscan -H "$CONTROL_PLANE_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/control_plane_key \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -N -f \
+            -L 6443:127.0.0.1:6443 \
+            "${CONTROL_PLANE_USER}@${CONTROL_PLANE_HOST}"
+
+          CLUSTER_NAME="$(kubectl config view --kubeconfig "$KUBECONFIG" -o jsonpath='{.clusters[0].name}')"
+          kubectl config set-cluster "$CLUSTER_NAME" \
+            --server=https://127.0.0.1:6443 \
+            --kubeconfig "$KUBECONFIG" >/dev/null
+
+      - name: Verify cluster API reachability
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kubectl --request-timeout=15s cluster-info
+
       - name: Apply staging inference overlay
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           set -euo pipefail
-          kubectl apply -k k8s/inference/overlays/staging/
+          kubectl --request-timeout=30s apply --validate=false -k k8s/inference/overlays/staging/
           echo "Staging manifests applied."
+
+      - name: Restart staging serving deployments
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          # Pods still use :latest and ConfigMap-backed Python modules, so force a restart after
+          # apply to pick up freshly built images and generator/classifier code updates.
+          kubectl rollout restart deployment/classifier-pytorch-staging -n ml-serving
+          kubectl rollout restart deployment/tone-generator-staging -n ml-serving
 
       - name: Wait for classifier-pytorch-staging rollout
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
-          kubectl rollout status deployment/classifier-pytorch-staging \
+          kubectl --request-timeout=30s rollout status deployment/classifier-pytorch-staging \
             -n ml-serving --timeout=300s
 
       - name: Wait for tone-generator-staging rollout
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
-          kubectl rollout status deployment/tone-generator-staging \
+          kubectl --request-timeout=30s rollout status deployment/tone-generator-staging \
             -n ml-serving --timeout=300s
 
       - name: Smoke test via port-forward (classifier)

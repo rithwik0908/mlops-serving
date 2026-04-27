@@ -1,42 +1,28 @@
-# OpenStack / Chameleon (IaC)
+# OpenStack Terraform
 
-Provisions a single VM and associates a **floating IP**—typical pattern for a one-node **k3s** or jump host. Names include `project_id_suffix`.
+This module provisions the two-node Chameleon environment used by the project.
 
-## Before apply
+## What it creates
 
-1. Confirm your **Blazar lease** is **ACTIVE** in Horizon (reservation id and `openstack_tenant_id` are pre-filled in `terraform.tfvars.example` for project 15).
-2. In Horizon or CLI, note **`network_id`**, **`key_pair`**, and at least one **security group** (SSH from your IP; **80** and **443** for Ingress).
-3. Copy `terraform.tfvars.example` → `terraform.tfvars` (gitignored). Fill **`key_pair`**, **`network_id`**, and **application credential** id/secret (or use `TF_VAR_*` / `OS_*` env vars — see `providers.tf`).
-4. Set `install_k3s_cloud_init = true` if you want k3s installed on first boot (simple single-node cluster). Otherwise use Ansible `k3s_install.yml` after SSH works.
+- one control-plane instance
+- one worker instance
+- one floating IP attached to the control-plane
+- optional persistent block volume attached to the control-plane
+- managed security group rules for SSH, HTTP, HTTPS, and internal k3s traffic
+- outputs that generate the Ansible inventory
 
-## Floating IP error: “External network … is not reachable from subnet …”
+## Required local inputs
 
-Your private subnet needs a **router** with **external gateway** to the pool you use for floating IPs (`floating_ip_pool`, usually `public`). This module can create **`create_public_router = true`** (default) and attach the first subnet on `network_id`.
+Create `terraform.tfvars` from `terraform.tfvars.example` and fill in:
 
-If you already fixed routing in Horizon, set **`create_public_router = false`** to avoid duplicate routers.
+- OpenStack auth values or use `TF_VAR_*` environment variables
+- `network_id`
+- `key_pair`
+- lease or reservation ids
+- image and flavor selections if different from defaults
+- block volume settings if you want the control-plane data disk reattached automatically
 
-## Authentication (Chameleon + college SSO)
-
-Use an **application credential** from Horizon (**Identity → Application Credentials**). Do not commit `application_credential_secret`.
-
-Either put values in `terraform.tfvars` (local only) or use:
-
-```powershell
-$env:TF_VAR_application_credential_id     = "..."
-$env:TF_VAR_application_credential_secret = "..."
-```
-
-Ensure **`openstack_auth_url`** ends with **`/v3`** (e.g. `https://kvm.tacc.chameleoncloud.org:5000/v3`).
-
-### Using a `clouds.yaml` (OpenStack CLI / optional)
-
-1. Save your file as **`%USERPROFILE%\.config\openstack\clouds.yaml`** (Windows) or **`~/.config/openstack/clouds.yaml`** (Linux/macOS/WSL). **Do not** commit it to this repo; `clouds.yaml` is gitignored if placed under the project tree by mistake.
-2. Under `auth`, use **`auth_url: https://kvm.tacc.chameleoncloud.org:5000/v3`** (trailing **`/v3`** matches Terraform and avoids subtle auth failures).
-3. For **`python-openstackclient`**: `set OS_CLOUD=openstack` (Windows) or `export OS_CLOUD=openstack`, then `openstack server list`, etc.
-
-**Terraform** does not read `clouds.yaml` by itself. Either keep **`application_credential_id`** / **`application_credential_secret`** in local **`terraform.tfvars`** (gitignored), or set the same values via **`TF_VAR_application_credential_*`** / **`OS_*`** as in repo root **`GETTING_STARTED.md`**.
-
-**If a secret was pasted in chat, email, or a ticket:** revoke that application credential in Horizon (**Identity → Application Credentials → Delete**), create a new one, and update only your **local** `clouds.yaml` / `terraform.tfvars` — never commit the secret.
+## Apply
 
 ```bash
 terraform init
@@ -44,9 +30,58 @@ terraform plan
 terraform apply
 ```
 
-## After apply
+Equivalent single-command wrapper from the repo root:
 
-- SSH: `ssh -i ~/.ssh/your_key cc@<floating_ip>` (user may be `ubuntu` depending on image—check site docs).
-- If you used cloud-init k3s: copy `/etc/rancher/k3s/k3s.yaml` and replace `127.0.0.1` with the floating IP for API access from your laptop (or use SSH `-L` port-forward).
+```bash
+./infra/run-terraform --action apply --write-inventory
+```
 
-Then install Kubernetes and deploy services with **`../../ansible/`** (see repo `infra/ansible/README.md`).
+## Useful outputs
+
+```bash
+terraform output
+terraform output -raw ansible_inventory_ini
+```
+
+The generated inventory includes:
+
+- public `ansible_host` for the control-plane
+- private worker address
+- jump-host SSH path through the control-plane
+
+## Persistent block volume
+
+If you want live PVC data to survive VM recreation, the safest pattern is:
+
+1. create the block volume once
+2. keep the volume
+3. reattach the same volume on later `terraform apply` runs
+
+Use these `terraform.tfvars` settings:
+
+```hcl
+attach_block_volume      = true
+existing_block_volume_id = "your-existing-volume-uuid"
+```
+
+Terraform can also create the first volume for you:
+
+```hcl
+attach_block_volume      = true
+create_block_volume      = true
+block_volume_name        = "block-data-proj15"
+block_volume_size_gib    = 150
+block_volume_type        = "ceph-ssd"
+```
+
+Important:
+
+- Terraform can attach the volume, but the OS still needs it mounted.
+- The repo's Ansible flow handles the mount and `/etc/fstab` setup in [prepare_block_storage.yml](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible\playbooks\prepare_block_storage.yml).
+- If Terraform creates the volume, it is protected with `prevent_destroy` so you do not accidentally delete your live data during a normal `terraform destroy`.
+
+## Notes
+
+- The worker intentionally has no floating IP.
+- The control-plane floating IP is the public entry point for ingress and SSH.
+- Existing user-managed security groups can still be attached; Terraform also adds the project-managed security group used by the cluster.

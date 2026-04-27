@@ -1,12 +1,12 @@
-import os, json, boto3, pandas as pd
+import os, json, re, boto3, pandas as pd
 from datetime import datetime
 from io import BytesIO
 from botocore.client import Config
 
 BUCKET     = os.getenv("MINIO_BUCKET",     "zulip-rewriter")
-ENDPOINT   = os.getenv("MINIO_ENDPOINT", "https://129.114.27.192.nip.io")
-ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
-SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
+ENDPOINT   = os.getenv("MINIO_ENDPOINT",   "http://minio.ml-platform.svc.cluster.local:9000")
+ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
+SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 if not ACCESS_KEY or not SECRET_KEY:
     raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set (injected from minio-root Secret in K8s)")
 VERSION    = os.getenv("DATA_VERSION",     "v1")
@@ -25,6 +25,55 @@ s3 = boto3.client(
 )
 
 print(f"Batch pipeline starting | version={VERSION} | date={BATCH_DATE}")
+
+POLITE_MARKERS = [r"\bplease\b", r"\bthank\b", r"\bcould you\b", r"\bwould you\b", r"\bi appreciate\b", r"\bkindly\b"]
+INFORMAL_MARKERS = [r"\bhey\b", r"\byo\b", r"\bu\b", r"\bgonna\b", r"\bwanna\b", r"\bbtw\b", r"\bomg\b", r"\blol\b"]
+DRIFT_FEATURES = [
+    "word_count",
+    "char_count",
+    "polite_marker_count",
+    "informal_marker_count",
+    "has_question_mark",
+    "has_exclamation",
+    "estimated_formality",
+]
+
+
+def extract_features(text: str) -> dict:
+    tl = (text or "").lower()
+    words = tl.split()
+    polite = sum(1 for p in POLITE_MARKERS if re.search(p, tl))
+    informal = sum(1 for p in INFORMAL_MARKERS if re.search(p, tl))
+    return {
+        "word_count": len(words),
+        "char_count": len(text or ""),
+        "polite_marker_count": polite,
+        "informal_marker_count": informal,
+        "has_question_mark": int("?" in (text or "")),
+        "has_exclamation": int("!" in (text or "")),
+        "estimated_formality": round((polite - informal) / max(len(words), 1), 4),
+    }
+
+
+def build_drift_baseline(df: pd.DataFrame) -> dict:
+    feature_df = pd.DataFrame([extract_features(text) for text in df["text"].dropna().astype(str)])
+    stats = {}
+    for feature in DRIFT_FEATURES:
+        series = feature_df[feature].astype(float)
+        stats[feature] = {
+            "mean": round(float(series.mean()), 6),
+            "std": round(float(series.std(ddof=0)), 6),
+            "min": round(float(series.min()), 6),
+            "max": round(float(series.max()), 6),
+            "count": int(series.count()),
+        }
+    return {
+        "baseline_type": "training_corpus_features",
+        "created_at": datetime.utcnow().isoformat(),
+        "feature_count": len(DRIFT_FEATURES),
+        "sample_count": int(len(feature_df)),
+        "features": stats,
+    }
 
 print("Step 1: Loading base corpus from MinIO...")
 obj      = s3.get_object(Bucket=BUCKET, Key=f"raw/{VERSION}/full.parquet")
@@ -127,12 +176,13 @@ s3.put_object(
 print(f"  Feedback manifest: {json.dumps(feedback_manifest)}")
 
 print("Step 3: Candidate selection (no leakage)...")
-df_train = df_base[
+df_train_seed = df_base[
     (df_base["text"].str.split().str.len() >= 5) &
     (df_base["binary_label"].notna()) &
     (~df_base["text"].duplicated()) &
     (df_base["split"] == "train")
 ].copy()
+df_train = df_train_seed.copy()
 
 df_test = df_base[
     (df_base["text"].str.split().str.len() >= 5) &
@@ -150,6 +200,12 @@ if not df_feedback_text.empty:
 
 print(f"  Train: {len(df_train)} | Test: {len(df_test)}")
 
+print("Step 3b: Building production drift baseline from training corpus...")
+drift_baseline = build_drift_baseline(df_train_seed)
+drift_baseline["source_rows"] = int(len(df_train_seed))
+drift_baseline["batch_date"] = BATCH_DATE
+print(f"  Drift baseline samples: {drift_baseline['sample_count']}")
+
 print("Step 4: Uploading versioned datasets...")
 batch_ver = f"{VERSION}_batch_{BATCH_DATE}"
 
@@ -162,6 +218,18 @@ def upload(df, name):
 
 upload(df_train, "train")
 upload(df_test,  "test")
+s3.put_object(
+    Bucket=BUCKET,
+    Key=f"batch/{BATCH_DATE}/drift_baseline.json",
+    Body=json.dumps(drift_baseline, indent=2),
+)
+s3.put_object(
+    Bucket=BUCKET,
+    Key=f"batch/{batch_ver}/drift_baseline.json",
+    Body=json.dumps(drift_baseline, indent=2),
+)
+print(f"  Uploaded batch/{BATCH_DATE}/drift_baseline.json")
+print(f"  Uploaded batch/{batch_ver}/drift_baseline.json")
 
 manifest = {
     "batch_version":        batch_ver,
@@ -171,6 +239,7 @@ manifest = {
     "online_log_rows":      len(df_online),
     "feedback_rows_merged": len(df_feedback_text),
     "feedback_approval_rate": feedback_manifest.get("approval_rate"),
+    "drift_baseline_key":   f"batch/{batch_ver}/drift_baseline.json",
     "leakage_policy":       "test set fixed from original corpus; online logs and feedback training-only",
     "filters":              {"min_words": 5, "require_label": True, "deduplicated": True},
 }

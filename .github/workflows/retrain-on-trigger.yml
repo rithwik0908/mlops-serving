@@ -2,22 +2,23 @@
 # data/retrain_trigger/retrain_trigger.py (running as k8s/data/retrain-trigger-cronjob.yaml).
 #
 # If an unprocessed trigger is found:
-#   1. Applies batch data pipeline job (to rebuild training dataset with latest feedback).
+#   1. Applies the batch data pipeline job (rebuild training dataset with latest feedback).
 #   2. Deletes + re-applies classifier and generator training jobs.
 #   3. Waits for both training jobs to complete (up to 3 hours each).
-#   4. Applies register-bundle (MLflow model registration + alias update).
-#   5. Marks trigger record as processed in MinIO.
+#   4. Applies register-bundle (MLflow model registration + alias updates).
+#      Quality gates: f1_macro >= 0.70, worst-class F1 >= 0.55.
+#   5. Rolls out canary deployments (classifier + generator) to pick up the new model.
+#   6. Waits for canary rollout then runs a smoke test.
+#   7. Promotes canary to prod only if the latest training metrics pass the production gates.
+#   8. Marks the trigger record as processed in MinIO.
 #
-# Promotion (canary → prod) is intentionally NOT automatic — use promote-inference.yml
-# after reviewing the MLflow run metrics (F1, latency, safety).
-#
-# Schedule: daily at 03:00 UTC (one hour after retrain_trigger CronJob at 02:00).
+# Schedule: daily at 03:00 UTC (one hour after retrain-trigger CronJob at 02:00).
 # Can also be triggered manually (workflow_dispatch) to reprocess a trigger.
 #
 # Requires repository secrets:
-#   KUBE_CONFIG_B64    — base64 kubeconfig (rights to ml-data + ml-training namespaces)
-#   MINIO_ACCESS_KEY   — MinIO root user
-#   MINIO_SECRET_KEY   — MinIO root password
+#   KUBE_CONFIG_B64    - base64 kubeconfig (rights to ml-data + ml-training namespaces)
+#   MINIO_ACCESS_KEY   - MinIO root user
+#   MINIO_SECRET_KEY   - MinIO root password
 name: Retrain on trigger
 
 on:
@@ -38,12 +39,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install kubectl + Python deps
         run: |
           curl -sSL https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl -o /usr/local/bin/kubectl
           chmod +x /usr/local/bin/kubectl
-          pip install boto3==1.34.69 --quiet
+          pip install boto3==1.34.69 requests==2.32.3 --quiet
 
       - name: Write kubeconfig
         env:
@@ -58,6 +61,71 @@ jobs:
           chmod 600 "$RUNNER_TEMP/kubeconfig"
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
 
+      - name: Tunnel Kubernetes API over SSH
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          CONTROL_PLANE_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          CONTROL_PLANE_USER: ${{ vars.CONTROL_PLANE_USER }}
+          CONTROL_PLANE_SSH_KEY: ${{ secrets.CONTROL_PLANE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTROL_PLANE_HOST:-}" ] || [ -z "${CONTROL_PLANE_USER:-}" ]; then
+            echo "::error::Missing Actions variables CONTROL_PLANE_HOST and/or CONTROL_PLANE_USER."
+            exit 1
+          fi
+          if [ -z "${CONTROL_PLANE_SSH_KEY:-}" ]; then
+            echo "::error::Missing repository secret CONTROL_PLANE_SSH_KEY."
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$CONTROL_PLANE_SSH_KEY" > ~/.ssh/control_plane_key
+          chmod 600 ~/.ssh/control_plane_key
+          ssh-keyscan -H "$CONTROL_PLANE_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/control_plane_key \
+            -o BatchMode=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -N -f \
+            -L 6443:127.0.0.1:6443 \
+            "${CONTROL_PLANE_USER}@${CONTROL_PLANE_HOST}"
+
+          CLUSTER_NAME="$(kubectl config view --kubeconfig "$KUBECONFIG" -o jsonpath='{.clusters[0].name}')"
+          kubectl config set-cluster "$CLUSTER_NAME" \
+            --server=https://127.0.0.1:6443 \
+            --kubeconfig "$KUBECONFIG" >/dev/null
+
+      - name: Verify cluster API reachability
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          kubectl --request-timeout=15s cluster-info
+
+      - name: Start port-forwards for MLflow and MinIO
+        run: |
+          set -euo pipefail
+          kubectl port-forward -n ml-platform svc/minio 19000:9000 >/tmp/pf-minio.log 2>&1 &
+          echo "PF_MINIO_PID=$!" >> "$GITHUB_ENV"
+          kubectl port-forward -n ml-platform svc/mlflow 15000:5000 >/tmp/pf-mlflow.log 2>&1 &
+          echo "PF_MLFLOW_PID=$!" >> "$GITHUB_ENV"
+          for attempt in 1 2 3; do
+            if curl -fsS http://127.0.0.1:19000/minio/health/live >/dev/null && \
+               curl -fsS http://127.0.0.1:15000/ >/dev/null; then
+              echo "MinIO and MLflow port-forwards are ready."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Port-forward checks failed."
+          echo "--- MinIO port-forward log ---"
+          cat /tmp/pf-minio.log || true
+          echo "--- MLflow port-forward log ---"
+          cat /tmp/pf-mlflow.log || true
+          exit 1
+
       - name: Check for unprocessed retrain trigger in MinIO
         id: trigger_check
         env:
@@ -71,16 +139,15 @@ jobs:
           from datetime import datetime, timezone, timedelta
 
           if os.environ.get("FORCE") == "true":
-              print("FORCE=true — skipping trigger check")
-              print("trigger_found=true")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              print("FORCE=true - skipping trigger check")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                   f.write("trigger_found=true\n")
                   f.write("trigger_key=\n")
               sys.exit(0)
 
           s3 = boto3.client(
               "s3",
-              endpoint_url="http://minio.ml-platform.svc.cluster.local:9000",
+              endpoint_url="http://127.0.0.1:19000",
               aws_access_key_id=os.environ["MINIO_ACCESS_KEY"],
               aws_secret_access_key=os.environ["MINIO_SECRET_KEY"],
               verify=False,
@@ -108,14 +175,14 @@ jobs:
 
           found = trigger_key is not None
           print(f"trigger_found={found}, trigger_key={trigger_key}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"trigger_found={'true' if found else 'false'}\n")
               f.write(f"trigger_key={trigger_key or ''}\n")
           EOF
 
       - name: Skip if no trigger
         if: steps.trigger_check.outputs.trigger_found != 'true'
-        run: echo "No unprocessed retrain trigger found — nothing to do."
+        run: echo "No unprocessed retrain trigger found - nothing to do."
 
       - name: Run batch data pipeline (rebuild training dataset with latest feedback)
         if: steps.trigger_check.outputs.trigger_found == 'true'
@@ -166,6 +233,120 @@ jobs:
             -n ml-training --timeout=600s
           echo "Models registered and aliases updated."
 
+      - name: Rollout canary deployments (pick up new model)
+        if: steps.trigger_check.outputs.trigger_found == 'true'
+        run: |
+          set -euo pipefail
+          kubectl rollout restart deployment/classifier-pytorch-canary -n ml-serving
+          kubectl rollout restart deployment/tone-generator-canary -n ml-serving
+          kubectl rollout status deployment/classifier-pytorch-canary -n ml-serving --timeout=600s
+          kubectl rollout status deployment/tone-generator-canary -n ml-serving --timeout=600s
+          echo "Canary rollout complete."
+
+      - name: Canary smoke test
+        if: steps.trigger_check.outputs.trigger_found == 'true'
+        run: |
+          set -euo pipefail
+          kubectl port-forward svc/classifier-pytorch-canary 18001:8001 -n ml-serving &
+          PF_C=$!
+          kubectl port-forward svc/tone-generator-canary 18010:8010 -n ml-serving &
+          PF_G=$!
+          sleep 8
+          bash serving/scripts/smoke_predict_generate.sh http://127.0.0.1:18001 http://127.0.0.1:18010
+          kill "$PF_C" "$PF_G" 2>/dev/null || true
+          echo "Canary smoke test passed."
+
+      - name: Promote canary to prod (automated quality gates)
+        if: steps.trigger_check.outputs.trigger_found == 'true'
+        run: |
+          python3 - <<'EOF'
+          import sys
+          import requests
+
+          MLFLOW = "http://127.0.0.1:15000"
+          MIN_F1_MACRO = 0.70
+          MIN_WORST_CLASS_F1 = 0.55
+          MAX_GEN_LOSS = 3.0
+
+          def get_latest_metrics(experiment_name: str):
+              try:
+                  resp = requests.get(
+                      f"{MLFLOW}/api/2.0/mlflow/experiments/search",
+                      params={"filter": f"name = '{experiment_name}'", "max_results": 1},
+                      timeout=15,
+                  )
+                  resp.raise_for_status()
+                  exp_id = resp.json()["experiments"][0]["experiment_id"]
+                  runs_resp = requests.post(
+                      f"{MLFLOW}/api/2.0/mlflow/runs/search",
+                      json={
+                          "experiment_ids": [exp_id],
+                          "filter": "status = 'FINISHED'",
+                          "max_results": 1,
+                          "order_by": ["attributes.start_time DESC"],
+                      },
+                      timeout=15,
+                  )
+                  runs_resp.raise_for_status()
+                  runs = runs_resp.json().get("runs", [])
+                  if not runs:
+                      return {}
+                  return {m["key"]: m["value"] for m in runs[0]["data"].get("metrics", [])}
+              except Exception as exc:
+                  print(f"[promote] MLflow query failed for {experiment_name}: {exc}")
+                  return {}
+
+          clf_m = get_latest_metrics("teamchat_tone_clf")
+          gen_m = get_latest_metrics("teamchat_tone_generator_llm")
+
+          f1_macro = float(clf_m.get("f1_macro", 0) or 0)
+          worst_cls_f1 = min(
+              float(clf_m.get(f"f1_{lbl}", 1) or 1)
+              for lbl in ("formal", "friendly", "neutral")
+          )
+          gen_loss = float(gen_m.get("last_eval_loss") or gen_m.get("last_train_loss") or 999)
+
+          print(f"[promote] clf f1_macro={f1_macro:.3f} worst_class_f1={worst_cls_f1:.3f} gen_loss={gen_loss:.3f}")
+
+          gates_pass = (
+              f1_macro >= MIN_F1_MACRO and
+              worst_cls_f1 >= MIN_WORST_CLASS_F1 and
+              gen_loss <= MAX_GEN_LOSS
+          )
+          if not gates_pass:
+              print(
+                  f"[promote] Quality gates FAILED "
+                  f"(f1_macro={f1_macro:.3f}<{MIN_F1_MACRO} or "
+                  f"worst_cls={worst_cls_f1:.3f}<{MIN_WORST_CLASS_F1} or "
+                  f"gen_loss={gen_loss:.3f}>{MAX_GEN_LOSS}). "
+                  "Canary keeps the new model; prod NOT updated."
+              )
+              sys.exit(0)
+
+          print("[promote] Gates passed. Promoting @canary to @prod...")
+          for model_name in ("tone-classifier", "tone-generator-lora"):
+              try:
+                  ver_resp = requests.get(
+                      f"{MLFLOW}/api/2.0/mlflow/registered-models/alias",
+                      params={"name": model_name, "alias": "canary"},
+                      timeout=10,
+                  )
+                  ver_resp.raise_for_status()
+                  version = ver_resp.json()["model_version"]["version"]
+                  patch_resp = requests.patch(
+                      f"{MLFLOW}/api/2.0/mlflow/registered-models/alias",
+                      json={"name": model_name, "alias": "prod", "version": version},
+                      timeout=10,
+                  )
+                  patch_resp.raise_for_status()
+                  print(f"[promote] {model_name}@prod -> v{version}")
+              except Exception as exc:
+                  print(f"[promote] Failed to update {model_name}@prod: {exc}", file=sys.stderr)
+                  sys.exit(1)
+
+          print("[promote] Promotion complete. Prod pods will reload on next /ready cycle.")
+          EOF
+
       - name: Mark trigger record as processed in MinIO
         if: steps.trigger_check.outputs.trigger_found == 'true'
         env:
@@ -180,12 +361,12 @@ jobs:
 
           key = os.environ.get("TRIGGER_KEY", "")
           if not key:
-              print("No trigger key to mark — skipping.")
-              exit(0)
+              print("No trigger key to mark - skipping.")
+              raise SystemExit(0)
 
           s3 = boto3.client(
               "s3",
-              endpoint_url="http://minio.ml-platform.svc.cluster.local:9000",
+              endpoint_url="http://127.0.0.1:19000",
               aws_access_key_id=os.environ["MINIO_ACCESS_KEY"],
               aws_secret_access_key=os.environ["MINIO_SECRET_KEY"],
               verify=False,
@@ -196,9 +377,12 @@ jobs:
           rec["processed"] = True
           rec["processed_at"] = datetime.now(timezone.utc).isoformat()
           rec["processed_by"] = "retrain-on-trigger GitHub Actions"
-          s3.put_object(Bucket=bucket, Key=key,
-                        Body=json.dumps(rec, indent=2).encode(),
-                        ContentType="application/json")
+          s3.put_object(
+              Bucket=bucket,
+              Key=key,
+              Body=json.dumps(rec, indent=2).encode(),
+              ContentType="application/json",
+          )
           print(f"Marked {key} as processed.")
           EOF
 
@@ -208,3 +392,8 @@ jobs:
           kubectl get pods -n ml-training -o wide || true
           kubectl get events -n ml-training --sort-by='.lastTimestamp' \
             --field-selector reason=Failed 2>/dev/null | tail -20 || true
+
+      - name: Stop port-forwards
+        if: always()
+        run: |
+          kill "${PF_MINIO_PID:-}" "${PF_MLFLOW_PID:-}" 2>/dev/null || true

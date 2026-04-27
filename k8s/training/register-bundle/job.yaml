@@ -23,8 +23,6 @@ spec:
         role: training
     spec:
       restartPolicy: Never
-      imagePullSecrets:
-        - name: ghcr-pull
       volumes:
         - name: register-script
           configMap:
@@ -38,20 +36,24 @@ spec:
             - name: register-script
               mountPath: /scripts
               readOnly: true
-          command: ["python", "/scripts/register_and_alias_latest.py"]
+          command:
+            - sh
+            - -c
           args:
-            - "--classifier-experiment=teamchat_tone_clf"
-            - "--classifier-run-name=candidate_tone_distilbert"
-            - "--classifier-model-name=tone-classifier"
-            - "--classifier-artifact-path=model"
-            - "--generator-experiment=teamchat_tone_generator_llm"
-            - "--generator-run-name=smollm2_135m_lora_cpu"
-            - "--generator-model-name=tone-generator-lora"
-            - "--generator-artifact-path=lora_checkpoint"
-            - "--aliases=canary,prod"
-            - "--min-classifier-f1-macro=0.70"
-            - "--min-classifier-worst-class-f1=0.55"
-            - "--skip-quality-gates"
+            - |
+              python -c "import boto3" >/dev/null 2>&1 || python -m pip install --no-cache-dir boto3
+              exec python /scripts/register_and_alias_latest.py \
+                --classifier-experiment=teamchat_tone_clf \
+                --classifier-run-name=candidate_tone_distilbert \
+                --classifier-model-name=tone-classifier \
+                --classifier-artifact-path=model \
+                --generator-experiment=teamchat_tone_generator_llm \
+                --generator-run-name=smollm2_135m_lora_cpu \
+                --generator-model-name=tone-generator-lora \
+                --generator-artifact-path=lora_checkpoint \
+                --aliases=canary,prod \
+                --min-classifier-f1-macro=0.70 \
+                --min-classifier-worst-class-f1=0.55
           env:
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.ml-platform.svc.cluster.local:5000"

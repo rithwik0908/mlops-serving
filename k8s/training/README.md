@@ -1,58 +1,301 @@
-# Training → Serving wiring (end-to-end)
+# Training
 
-This repo supports an end-to-end path where a **training run registers a model in MLflow Model Registry**, and the **serving tier loads the model by alias** (no manual copying of artifacts into the serving container).
+Training jobs run in namespace `ml-training`.
 
-## What is wired
+## What is here
 
-- Training logs metrics + artifacts to MLflow (`ml-platform`).
-- `register_and_alias_latest.py` registers the latest successful run(s) and updates aliases like `canary` / `prod`.
-- Serving loads the classifier model via `CLASSIFIER_MODEL_URI=models:/tone-classifier@prod` (production tier) or `@canary` (canary tier).
-- Zulip user flow uses `zulip-bridge` → `tone-generator-prod` → `classifier-pytorch-prod`, so the UI hits the model-backed path.
+- classifier training job
+- generator training job
+- register bundle that updates MLflow aliases
 
-## How to run the end-to-end update
+## Runtime flow
 
-Run these on the cluster VM (or any machine with working `kubectl` for the cluster).
+1. Training jobs read data from MinIO.
+2. Runs are logged to MLflow.
+3. `register-and-alias-latest` assigns aliases such as `canary` and `prod`.
+4. Serving deployments resolve models from those aliases.
 
-### 1) Run classifier training (produces a new MLflow run)
-
-```bash
-kubectl delete job -n ml-training classifier-training --ignore-not-found
-kubectl apply -f k8s/training/classifier-training-job.yaml
-kubectl logs -n ml-training -l job-name=classifier-training -f
-```
-
-(Or `kubectl apply -k k8s/training/` — reapplies classifier + generator Job manifests only.)
-
-### 2) Register + alias the latest successful model run
-
-The register Job mounts the Python script from a **ConfigMap** in **`k8s/training/register-bundle/`** (stable ConfigMap name). Do **not** use `kubectl apply -f` on the Job file alone.
+## Apply
 
 ```bash
-kubectl delete job -n ml-training register-and-alias-latest --ignore-not-found
+kubectl apply -k k8s/training/
 kubectl apply -k k8s/training/register-bundle/
-kubectl logs -n ml-training -l job-name=register-and-alias-latest -f
 ```
 
-If `kubectl apply -k` errors with **`spec.template: ... field is immutable`**, an older Job still exists — run the **`kubectl delete job`** line above, then apply again.
+In normal operation this is handled by [deploy_ml_workloads.yml](C:\Users\sudha\OneDrive\Desktop\MLOps\Multi-Tone-Communication-Assistant-for-Zulip---MLOps\infra\ansible\playbooks\deploy_ml_workloads.yml).
 
-### 3) Restart serving to pick up the new alias
-
-The production classifier deployment is configured to download from:
-
-- `models:/tone-classifier@prod`
-
-Restarting the deployment forces a re-resolve and re-download:
+## Verification
 
 ```bash
-kubectl rollout restart -n ml-serving deployment/classifier-pytorch-prod
-kubectl rollout status  -n ml-serving deployment/classifier-pytorch-prod --timeout=600s
+kubectl get jobs,pods -n ml-training
+kubectl logs -n ml-training job/classifier-training
+kubectl logs -n ml-training job/generator-training
+kubectl logs -n ml-training job/register-and-alias-latest
 ```
 
-## Troubleshooting
+## Retraining And Feedback Verification
 
-- **Job fails: secret `minio-root` not found in `ml-training`**  
-  Ensure you ran `infra/ansible/playbooks/deploy_ml_workloads.yml` after `deploy_platform.yml`. That playbook replicates `minio-root` into both `ml-data` and `ml-training`.
+Use these checks to prove the feedback-to-retraining path is working.
 
-- **Serving fails to load model URI**  
-  Confirm MLflow has Model Registry enabled and the alias exists. You can test in the MLflow UI.
+### 1. Confirm feedback was captured
 
+Feedback is written by `zulip-bridge` into MinIO under `feedback/YYYY-MM-DD/`.
+
+On the control-plane VM:
+
+```bash
+python3 - <<'PY'
+import boto3
+from botocore.client import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+resp = s3.list_objects_v2(Bucket="zulip-rewriter", Prefix="feedback/")
+for obj in resp.get("Contents", []):
+    print(obj["Key"])
+PY
+```
+
+Expected result:
+
+- feedback objects exist under `feedback/YYYY-MM-DD/...`
+
+### 2. Confirm the batch pipeline merged feedback into training data
+
+The batch pipeline writes feedback summaries into MinIO and merges `preferred_text`
+rows into the next training set.
+
+```bash
+python3 - <<'PY'
+import boto3, json
+from botocore.client import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+for key in [
+    "batch/2026-04-22/feedback_manifest.json",
+    "batch/v1_batch_2026-04-22/manifest.json",
+]:
+    try:
+        obj = s3.get_object(Bucket="zulip-rewriter", Key=key)
+        print(f"=== {key} ===")
+        print(json.dumps(json.loads(obj["Body"].read()), indent=2))
+    except Exception as exc:
+        print(f"{key}: {exc}")
+PY
+```
+
+Important fields:
+
+- `feedback_total_entries`
+- `feedback_usable_for_training`
+- `feedback_rows_merged`
+
+Drift baseline files are also generated by the batch pipeline:
+
+- `batch/YYYY-MM-DD/drift_baseline.json`
+- `batch/v1_batch_YYYY-MM-DD/drift_baseline.json`
+
+### 3. Confirm a retrain trigger record exists
+
+The retrain trigger writes records into MinIO under `triggers/YYYY-MM-DD/`.
+
+```bash
+python3 - <<'PY'
+import boto3
+from botocore.client import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+resp = s3.list_objects_v2(Bucket="zulip-rewriter", Prefix="triggers/")
+for obj in resp.get("Contents", []):
+    print(obj["Key"])
+PY
+```
+
+Inspect one trigger:
+
+```bash
+python3 - <<'PY'
+import boto3, json
+from botocore.client import Config
+
+key = "triggers/2026-04-22/trigger_1776895765.json"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+obj = s3.get_object(Bucket="zulip-rewriter", Key=key)
+print(json.dumps(json.loads(obj["Body"].read()), indent=2))
+PY
+```
+
+Important fields:
+
+- `reasons`
+- `metrics.new_feedback_count`
+- `metrics.approval_rate`
+- `metrics.drift_score`
+- `metrics.drift_sample_count`
+- `metrics.drift_features`
+- `processed`
+
+### 3b. Confirm production drift evaluation is being written
+
+The retrain trigger now writes a drift evaluation for each run under `drift/evaluations/`.
+
+```bash
+python3 - <<'PY'
+import boto3, json
+from botocore.client import Config
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+resp = s3.list_objects_v2(Bucket="zulip-rewriter", Prefix="drift/evaluations/")
+for obj in resp.get("Contents", []):
+    print(obj["Key"])
+PY
+```
+
+Inspect one evaluation:
+
+```bash
+python3 - <<'PY'
+import boto3, json
+from botocore.client import Config
+
+key = "drift/evaluations/2026-04-22/drift_0000000000.json"  # replace with latest key
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://10.43.157.41:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minio-password",
+    verify=False,
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+obj = s3.get_object(Bucket="zulip-rewriter", Key=key)
+print(json.dumps(json.loads(obj["Body"].read()), indent=2))
+PY
+```
+
+Important drift fields:
+
+- `baseline_key`
+- `sample_count`
+- `overall_score`
+- `feature_scores`
+- `features_over_threshold`
+
+### 4. Confirm retraining is actively running
+
+```bash
+kubectl get jobs,pods -n ml-training
+kubectl get pods -n ml-training -w
+```
+
+During an active retrain cycle you should see:
+
+- `classifier-training`
+- `generator-training`
+- `register-and-alias-latest`
+
+### 5. Inspect the current retraining logs
+
+```bash
+kubectl logs -n ml-training job/classifier-training
+kubectl logs -n ml-training job/generator-training
+kubectl logs -n ml-training job/register-and-alias-latest
+```
+
+### 6. Confirm new MLflow runs were created
+
+Open MLflow and verify that the latest classifier and generator experiments have new
+run timestamps after the trigger time.
+
+### 7. Confirm alias updates
+
+After successful training and registration:
+
+- `tone-classifier@canary` should move to the newest good version
+- `tone-generator-lora@canary` should move to the newest good version
+- `prod` moves only if the promotion gates pass
+
+## How To See Already Completed Retraining
+
+If retraining already finished, `kubectl logs job/...` may no longer work because
+the Job or Pod can be garbage-collected. Use these sources instead:
+
+### MLflow
+
+Best source for completed retrains:
+
+- experiment history
+- metrics
+- parameters
+- run timestamps
+- registered model versions
+
+### MinIO
+
+Best source for trigger and dataset history:
+
+- `feedback/YYYY-MM-DD/...`
+- `batch/YYYY-MM-DD/feedback_manifest.json`
+- `batch/v1_batch_YYYY-MM-DD/manifest.json`
+- `triggers/YYYY-MM-DD/trigger_*.json`
+
+### Kubernetes
+
+Useful only while jobs still exist:
+
+```bash
+kubectl get jobs -n ml-training
+kubectl describe job classifier-training -n ml-training
+kubectl get events -n ml-training --sort-by='.lastTimestamp' | tail -50
+```
+
+If the job TTL has expired and the pod was removed, the durable history is MLflow and MinIO,
+not Kubernetes logs.
+
+## Notes
+
+- The register job is applied from `register-bundle/` so the ConfigMap and Job stay aligned.
+- The current playbook waits for both training jobs and the register job to finish.
+- The retrain trigger runs in `ml-data` and writes trigger records into MinIO; the
+  GitHub workflow reacts to those records and launches the training jobs.

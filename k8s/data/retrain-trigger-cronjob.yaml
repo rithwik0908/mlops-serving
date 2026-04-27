@@ -1,18 +1,18 @@
-# Daily retraining trigger — runs retrain_trigger.py which evaluates:
+---
+# Daily retraining trigger - runs retrain_trigger.py which evaluates:
 #   DATA_TRIGGER:    >= 500 new feedback entries since last retrain
 #   QUALITY_TRIGGER: rolling 7-day approval rate (thumbs_up/total) < 0.70
 #   DRIFT_TRIGGER:   production MLflow F1 < 0.60
 #
 # If any condition fires:
 #   - Writes triggers/YYYY-MM-DD/trigger_<ts>.json to MinIO
-#   - Exits with code 10
+#   - Exits 0 after persisting the trigger record
 #   - GitHub Actions retrain-on-trigger.yml detects the trigger record and
-#     applies k8s/training/ + k8s/training/register-bundle/ (no kubectl needed here)
+#     applies k8s/training/ + k8s/training/register-bundle/
 #
 # Tune thresholds via env vars without rebuilding:
 #   DATA_TRIGGER_COUNT, QUALITY_THRESHOLD, DRIFT_THRESHOLD, LOOKBACK_DAYS
 #   DRY_RUN=true for smoke-testing the script without actually writing a trigger.
----
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -22,7 +22,6 @@ metadata:
     app: retrain-trigger
     role: data
 spec:
-  # Run at 02:00 UTC daily (after batch pipeline at 01:00, before team stand-up)
   schedule: "0 2 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -38,13 +37,21 @@ spec:
             role: data
         spec:
           restartPolicy: Never
+          volumes:
+            - name: retrain-trigger-code
+              configMap:
+                name: retrain-trigger-code
           containers:
             - name: retrain-trigger
-              image: ghcr.io/allusudharshanrao/mlops-data-batch:latest
+              image: python:3.11-slim
               imagePullPolicy: IfNotPresent
               command:
-                - python3
-                - /app/retrain_trigger/retrain_trigger.py
+                - sh
+                - -c
+                - |
+                  set -eu
+                  python -m pip install --no-cache-dir -r /app/retrain_trigger/requirements.txt
+                  python /app/retrain_trigger/retrain_trigger.py
               env:
                 - name: MINIO_ENDPOINT
                   value: "http://minio.ml-platform.svc.cluster.local:9000"
@@ -62,7 +69,6 @@ spec:
                       key: root-password
                 - name: MLFLOW_TRACKING_URI
                   value: "http://mlflow.ml-platform.svc.cluster.local:5000"
-                # Trigger thresholds (tune without rebuilding image)
                 - name: DATA_TRIGGER_COUNT
                   value: "500"
                 - name: QUALITY_THRESHOLD
@@ -73,6 +79,9 @@ spec:
                   value: "7"
                 - name: DRY_RUN
                   value: "false"
+              volumeMounts:
+                - name: retrain-trigger-code
+                  mountPath: /app/retrain_trigger
               resources:
                 requests:
                   cpu: "100m"

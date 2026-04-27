@@ -2,10 +2,11 @@ import os, json, time, random, requests, boto3, pandas as pd
 from datetime import datetime
 from io import BytesIO
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 ENDPOINT   = os.getenv("REWRITE_URL",      "http://localhost:8000/rewrite")
 BUCKET     = os.getenv("MINIO_BUCKET",     "zulip-rewriter")
-ENDPOINT_S3 = os.getenv("MINIO_ENDPOINT",   "https://129.114.27.192.nip.io") # Added https
+ENDPOINT_S3 = os.getenv("MINIO_ENDPOINT",   "http://minio.ml-platform.svc.cluster.local:9000")
 ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 RATE_SEC   = float(os.getenv("RATE_SECONDS", "2"))
@@ -16,13 +17,28 @@ s3 = boto3.client(
     endpoint_url=ENDPOINT_S3, 
     aws_access_key_id=ACCESS_KEY, 
     aws_secret_access_key=SECRET_KEY,
-    verify=False, # Bypasses the SSL error for .nip.io
+    verify=False,
     config=Config(
         signature_version='s3v4',
         s3={'addressing_style': 'path'}
     )
 )
 
+def wait_for_training_data() -> None:
+    key = f"raw/{VERSION}/train.parquet"
+    while True:
+        try:
+            s3.head_object(Bucket=BUCKET, Key=key)
+            print(f"Training data ready at s3://{BUCKET}/{key}")
+            return
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+            print(f"Training data not ready yet ({error_code}); sleeping 5s...")
+            time.sleep(5)
+
+
+print("Waiting for training data in MinIO...")
+wait_for_training_data()
 print("Loading training data from MinIO...")
 obj = s3.get_object(Bucket=BUCKET, Key=f"raw/{VERSION}/train.parquet")
 df  = pd.read_parquet(BytesIO(obj["Body"].read()))

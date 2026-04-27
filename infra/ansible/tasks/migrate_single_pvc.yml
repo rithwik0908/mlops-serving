@@ -1,0 +1,168 @@
+---
+- name: Set service-specific migration facts
+  ansible.builtin.set_fact:
+    migration_backup_file: "{{ backup_root }}/{{ migration_service.name }}.tgz"
+    migration_backup_pod: "backup-{{ migration_service.name }}"
+    migration_restore_pod: "restore-{{ migration_service.name }}"
+
+- name: Read current node for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    get pod -n {{ migration_service.namespace }} -l app={{ migration_service.app_label }}
+    -o jsonpath={.items[0].spec.nodeName}
+  register: migration_source_node
+  changed_when: false
+
+- name: Scale down {{ migration_service.deployment }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    scale deployment/{{ migration_service.deployment }}
+    -n {{ migration_service.namespace }} --replicas=0
+
+- name: Wait for {{ migration_service.deployment }} pods to stop
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    get pods -n {{ migration_service.namespace }} -l app={{ migration_service.app_label }}
+    --no-headers
+  register: migration_old_pods
+  changed_when: false
+  until: migration_old_pods.stdout_lines | length == 0
+  retries: 36
+  delay: 5
+
+- name: Create backup helper pod for {{ migration_service.name }}
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cat <<'EOF' | kubectl --kubeconfig {{ kubeconfig_path }} apply -f -
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: {{ migration_backup_pod }}
+      namespace: {{ migration_service.namespace }}
+      labels:
+        app: {{ migration_backup_pod }}
+    spec:
+      nodeName: {{ migration_source_node.stdout }}
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: backup
+          image: alpine:3.20
+          command: ["sh", "-c", "sleep 3600"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ migration_service.mount_path }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ migration_service.pvc_name }}
+    EOF
+  args:
+    executable: /bin/bash
+
+- name: Wait for backup helper pod for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    wait --for=condition=Ready pod/{{ migration_backup_pod }}
+    -n {{ migration_service.namespace }} --timeout=180s
+  changed_when: false
+
+- name: Stream backup for {{ migration_service.name }} to block storage
+  ansible.builtin.shell: |
+    set -euo pipefail
+    kubectl --kubeconfig {{ kubeconfig_path }} exec -n {{ migration_service.namespace }} {{ migration_backup_pod }} -- \
+      sh -c 'cd {{ migration_service.mount_path }} && tar czf - .' > {{ migration_backup_file }}
+  args:
+    executable: /bin/bash
+
+- name: Remove backup helper pod for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    delete pod/{{ migration_backup_pod }} -n {{ migration_service.namespace }} --ignore-not-found=true
+
+- name: Delete old PVC for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    delete pvc/{{ migration_service.pvc_name }} -n {{ migration_service.namespace }}
+
+- name: Wait for old PVC deletion for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    get pvc/{{ migration_service.pvc_name }} -n {{ migration_service.namespace }}
+  register: migration_deleted_pvc
+  changed_when: false
+  failed_when: false
+  until: migration_deleted_pvc.rc != 0
+  retries: 36
+  delay: 5
+
+- name: Recreate PVC manifest for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    apply -f {{ migration_service.pvc_manifest }}
+
+- name: Create restore helper pod for {{ migration_service.name }}
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cat <<'EOF' | kubectl --kubeconfig {{ kubeconfig_path }} apply -f -
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: {{ migration_restore_pod }}
+      namespace: {{ migration_service.namespace }}
+      labels:
+        app: {{ migration_restore_pod }}
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      nodeSelector:
+        {{ block_node_label_key }}: {{ block_node_label_value }}
+      containers:
+        - name: restore
+          image: alpine:3.20
+          command: ["sh", "-c", "sleep 3600"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ migration_service.restore_path }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ migration_service.pvc_name }}
+    EOF
+  args:
+    executable: /bin/bash
+
+- name: Wait for restore helper pod for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    wait --for=condition=Ready pod/{{ migration_restore_pod }}
+    -n {{ migration_service.namespace }} --timeout=180s
+  changed_when: false
+
+- name: Restore backup into new PVC for {{ migration_service.name }}
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cat {{ migration_backup_file }} | kubectl --kubeconfig {{ kubeconfig_path }} exec -i -n {{ migration_service.namespace }} {{ migration_restore_pod }} -- \
+      sh -c 'cd {{ migration_service.restore_path }} && tar xzf -'
+  args:
+    executable: /bin/bash
+
+- name: Remove restore helper pod for {{ migration_service.name }}
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    delete pod/{{ migration_restore_pod }} -n {{ migration_service.namespace }} --ignore-not-found=true
+
+- name: Scale {{ migration_service.deployment }} back up
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    scale deployment/{{ migration_service.deployment }}
+    -n {{ migration_service.namespace }} --replicas=1
+
+- name: Wait for {{ migration_service.deployment }} rollout
+  ansible.builtin.command: >
+    kubectl --kubeconfig {{ kubeconfig_path }}
+    rollout status deployment/{{ migration_service.deployment }}
+    -n {{ migration_service.namespace }} --timeout=300s
+  changed_when: false

@@ -6,12 +6,12 @@ Evaluates three independent trigger conditions:
   DATA_TRIGGER:    New feedback entries since last retrain >= DATA_TRIGGER_COUNT (default 500).
   QUALITY_TRIGGER: Rolling 7-day feedback approval rate < QUALITY_THRESHOLD (default 0.70).
                    Approval = (thumbs_up + selected) / total_feedback.
-  DRIFT_TRIGGER:   Mean classifier confidence (from batch feedback_manifest) < DRIFT_THRESHOLD
-                   (default 0.60) — proxy for input distribution shift.
+  DRIFT_TRIGGER:   Recent production request features diverge from the latest batch baseline
+                   by a normalized mean-shift score >= DRIFT_THRESHOLD (default 1.50).
 
 If ANY condition fires:
-  1. Writes a trigger record to MinIO:  triggers/YYYY-MM-DD/trigger_{ts}.json
-  2. Exits with code 10 so the K8s CronJob can surface it as a non-zero exit.
+  1. Writes a trigger record to MinIO: triggers/YYYY-MM-DD/trigger_{ts}.json
+  2. Exits 0 after persisting the trigger record.
      The GitHub Actions retrain-on-trigger.yml checks for new trigger records and
      applies k8s/training/ jobs + k8s/training/register-bundle/.
 
@@ -19,11 +19,11 @@ If no condition fires, exits 0 (normal).
 
 Environment variables:
   MINIO_ENDPOINT, MINIO_BUCKET, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
-  MLFLOW_TRACKING_URI      — for reading latest production run metrics
   DATA_TRIGGER_COUNT       — default 500
   QUALITY_THRESHOLD        — default 0.70
-  DRIFT_THRESHOLD          — default 0.60
-  LOOKBACK_DAYS            — number of days to scan feedback/ prefix (default 7)
+  DRIFT_THRESHOLD          — default 1.50
+  DRIFT_MIN_SAMPLES        — minimum recent production samples required (default 25)
+  LOOKBACK_DAYS            — number of days to scan feedback/ and feature_logs/ prefixes (default 7)
   DRY_RUN                  — "true" to evaluate but not write trigger record
 """
 
@@ -32,40 +32,40 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
-import time
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 
 import boto3
-import requests
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("retrain_trigger")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "http://minio.ml-platform.svc.cluster.local:9000")
-MINIO_BUCKET     = os.environ.get("MINIO_BUCKET",     "zulip-rewriter")
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio.ml-platform.svc.cluster.local:9000")
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "zulip-rewriter")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
-MLFLOW_URI       = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow.ml-platform.svc.cluster.local:5000")
 
 DATA_TRIGGER_COUNT = int(os.environ.get("DATA_TRIGGER_COUNT", "500"))
-QUALITY_THRESHOLD  = float(os.environ.get("QUALITY_THRESHOLD", "0.70"))
-DRIFT_THRESHOLD    = float(os.environ.get("DRIFT_THRESHOLD",   "0.60"))
-LOOKBACK_DAYS      = int(os.environ.get("LOOKBACK_DAYS",       "7"))
-DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
+QUALITY_THRESHOLD = float(os.environ.get("QUALITY_THRESHOLD", "0.70"))
+DRIFT_THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "1.50"))
+DRIFT_MIN_SAMPLES = int(os.environ.get("DRIFT_MIN_SAMPLES", "25"))
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-TRIGGER_EXIT_CODE = 10   # non-zero so CronJob/CI can detect trigger
+_WATERMARK_KEY = "triggers/last_retrain_watermark.json"
+_DRIFT_FEATURES = [
+    "word_count",
+    "char_count",
+    "polite_marker_count",
+    "informal_marker_count",
+    "has_question_mark",
+    "has_exclamation",
+    "estimated_formality",
+]
 
-
-# ---------------------------------------------------------------------------
-# MinIO helpers
-# ---------------------------------------------------------------------------
 
 def _s3():
     return boto3.client(
@@ -100,13 +100,6 @@ def _write_json(s3_client, key: str, data: dict) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Last-retrain watermark
-# ---------------------------------------------------------------------------
-
-_WATERMARK_KEY = "triggers/last_retrain_watermark.json"
-
-
 def _load_watermark(s3_client) -> dict:
     try:
         return _read_json(s3_client, _WATERMARK_KEY)
@@ -118,34 +111,26 @@ def _save_watermark(s3_client, data: dict) -> None:
     _write_json(s3_client, _WATERMARK_KEY, data)
 
 
-# ---------------------------------------------------------------------------
-# Trigger evaluations
-# ---------------------------------------------------------------------------
-
 def _count_recent_feedback(s3_client, since: datetime) -> tuple[int, float | None]:
-    """Return (total_count_since, approval_rate_or_None) from batch feedback_manifests."""
     cutoff = since.strftime("%Y-%m-%d")
     total, approved = 0, 0
-    # Read daily batch feedback_manifest.json files produced by batch_pipeline.py
     for obj_meta in _list_prefix(s3_client, "batch/"):
         key = obj_meta["Key"]
         if not key.endswith("feedback_manifest.json"):
             continue
-        # Key pattern: batch/{VERSION}_batch_{YYYY-MM-DD}/feedback_manifest.json
-        # Extract date from path
         parts = key.split("/")
         if len(parts) < 2:
             continue
-        batch_dir = parts[1]  # e.g. v1_batch_2026-04-20
-        batch_date = batch_dir.split("_batch_")[-1] if "_batch_" in batch_dir else ""
+        batch_dir = parts[1]
+        batch_date = batch_dir.split("_batch_")[-1] if "_batch_" in batch_dir else batch_dir
         if batch_date < cutoff:
             continue
         try:
             manifest = _read_json(s3_client, key)
-            total    += manifest.get("feedback_total_entries", 0)
-            approved += manifest.get("thumbs_up", 0)
-            approved += int(manifest.get("feedback_total_entries", 0) *
-                            (manifest.get("approval_rate", 0) or 0))
+            manifest_total = int(manifest.get("feedback_total_entries", 0) or 0)
+            manifest_approval = float(manifest.get("approval_rate", 0) or 0)
+            total += manifest_total
+            approved += round(manifest_total * manifest_approval)
         except Exception as exc:
             log.warning("Could not read %s: %s", key, exc)
 
@@ -153,155 +138,228 @@ def _count_recent_feedback(s3_client, since: datetime) -> tuple[int, float | Non
     return total, approval_rate
 
 
-def _get_production_model_f1(mlflow_uri: str) -> float | None:
-    """Query MLflow for the latest production classifier run's eval_f1 metric."""
-    try:
-        # Find experiment
-        resp = requests.get(
-            f"{mlflow_uri}/api/2.0/mlflow/experiments/search",
-            params={"filter": "name = 'teamchat_tone_clf'", "max_results": 1},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return None
-        exps = resp.json().get("experiments", [])
-        if not exps:
-            return None
-        exp_id = exps[0]["experiment_id"]
-
-        # Search for runs tagged production/champion/aliases
-        runs_resp = requests.post(
-            f"{mlflow_uri}/api/2.0/mlflow/runs/search",
-            json={
-                "experiment_ids": [exp_id],
-                "filter": "tags.mlflow.runName = 'production' OR tags.alias = 'prod'",
-                "max_results": 1,
-                "order_by": ["start_time DESC"],
-            },
-            timeout=10,
-        )
-        if runs_resp.status_code != 200:
-            return None
-        runs = runs_resp.json().get("runs", [])
-        if not runs:
-            # Fall back to latest finished run
-            runs_resp2 = requests.post(
-                f"{mlflow_uri}/api/2.0/mlflow/runs/search",
-                json={
-                    "experiment_ids": [exp_id],
-                    "filter": "status = 'FINISHED'",
-                    "max_results": 1,
-                    "order_by": ["start_time DESC"],
-                },
-                timeout=10,
-            )
-            runs = runs_resp2.json().get("runs", []) if runs_resp2.status_code == 200 else []
-        if not runs:
-            return None
-
-        metrics = {m["key"]: m["value"] for m in runs[0].get("data", {}).get("metrics", [])}
-        return float(metrics.get("eval_f1") or metrics.get("f1") or metrics.get("test_f1") or 0)
-    except Exception as exc:
-        log.warning("MLflow query failed (non-fatal): %s", exc)
-        return None
+def _key_date(key: str) -> str:
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", key)
+    return match.group(1) if match else ""
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _load_latest_drift_baseline(s3_client) -> tuple[str | None, dict | None]:
+    candidates = []
+    for obj_meta in _list_prefix(s3_client, "batch/"):
+        key = obj_meta["Key"]
+        if not key.endswith("drift_baseline.json"):
+            continue
+        candidates.append((_key_date(key), key))
+    if not candidates:
+        return None, None
+    _, latest_key = max(candidates, key=lambda item: (item[0], item[1]))
+    return latest_key, _read_json(s3_client, latest_key)
+
+
+def _load_recent_feature_logs(s3_client, since: datetime) -> list[dict]:
+    rows: list[dict] = []
+    for obj_meta in _list_prefix(s3_client, "feature_logs/"):
+        key = obj_meta["Key"]
+        if not key.endswith(".json"):
+            continue
+        try:
+            record = _read_json(s3_client, key)
+            created_at = record.get("created_at")
+            if created_at:
+                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if created_dt < since:
+                    continue
+            rows.append(record)
+        except Exception as exc:
+            log.warning("Could not read feature log %s: %s", key, exc)
+    return rows
+
+
+def _evaluate_drift(baseline: dict | None, feature_logs: list[dict]) -> dict:
+    if not baseline:
+        return {
+            "triggered": False,
+            "reason": "missing_baseline",
+            "sample_count": len(feature_logs),
+            "overall_score": None,
+            "feature_scores": {},
+            "features_over_threshold": [],
+        }
+
+    if len(feature_logs) < DRIFT_MIN_SAMPLES:
+        return {
+            "triggered": False,
+            "reason": "insufficient_live_samples",
+            "sample_count": len(feature_logs),
+            "overall_score": None,
+            "feature_scores": {},
+            "features_over_threshold": [],
+        }
+
+    live_values = {feature: [] for feature in _DRIFT_FEATURES}
+    for entry in feature_logs:
+        features = entry.get("features") or {}
+        for feature in _DRIFT_FEATURES:
+            value = features.get(feature)
+            if value is not None:
+                live_values[feature].append(float(value))
+
+    feature_scores = {}
+    live_summary = {}
+    for feature in _DRIFT_FEATURES:
+        baseline_stats = (baseline.get("features") or {}).get(feature)
+        if not baseline_stats or not live_values[feature]:
+            continue
+        baseline_mean = float(baseline_stats.get("mean", 0.0) or 0.0)
+        baseline_std = abs(float(baseline_stats.get("std", 0.0) or 0.0))
+        live_mean = sum(live_values[feature]) / len(live_values[feature])
+        scale_floor = max(abs(baseline_mean) * 0.1, 0.1)
+        denominator = max(baseline_std, scale_floor)
+        score = abs(live_mean - baseline_mean) / denominator
+        feature_scores[feature] = round(score, 4)
+        live_summary[feature] = {
+            "live_mean": round(live_mean, 6),
+            "baseline_mean": round(baseline_mean, 6),
+            "baseline_std": round(baseline_std, 6),
+            "sample_count": len(live_values[feature]),
+        }
+
+    if not feature_scores:
+        return {
+            "triggered": False,
+            "reason": "no_feature_overlap",
+            "sample_count": len(feature_logs),
+            "overall_score": None,
+            "feature_scores": {},
+            "features_over_threshold": [],
+            "live_summary": live_summary,
+        }
+
+    overall_score = max(feature_scores.values())
+    features_over_threshold = [name for name, score in feature_scores.items() if score >= DRIFT_THRESHOLD]
+    return {
+        "triggered": overall_score >= DRIFT_THRESHOLD,
+        "reason": "score_threshold" if overall_score >= DRIFT_THRESHOLD else "within_threshold",
+        "sample_count": len(feature_logs),
+        "overall_score": round(overall_score, 4),
+        "feature_scores": feature_scores,
+        "features_over_threshold": sorted(features_over_threshold),
+        "live_summary": live_summary,
+    }
+
 
 def main() -> None:
     log.info("=== Retrain trigger evaluation ===")
     log.info(
-        "Thresholds: data=%d quality=%.2f drift=%.2f lookback=%dd dry_run=%s",
-        DATA_TRIGGER_COUNT, QUALITY_THRESHOLD, DRIFT_THRESHOLD, LOOKBACK_DAYS, DRY_RUN,
+        "Thresholds: data=%d quality=%.2f drift=%.2f min_samples=%d lookback=%dd dry_run=%s",
+        DATA_TRIGGER_COUNT,
+        QUALITY_THRESHOLD,
+        DRIFT_THRESHOLD,
+        DRIFT_MIN_SAMPLES,
+        LOOKBACK_DAYS,
+        DRY_RUN,
     )
 
     s3 = _s3()
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=LOOKBACK_DAYS)
-
     watermark = _load_watermark(s3)
     log.info("Watermark: %s", watermark)
 
-    # --- DATA TRIGGER ---
     recent_feedback, approval_rate = _count_recent_feedback(s3, since)
     prev_count = watermark.get("feedback_count_at_retrain", 0)
     new_feedback = max(0, recent_feedback - prev_count)
     data_triggered = new_feedback >= DATA_TRIGGER_COUNT
     log.info(
-        "DATA_TRIGGER: new_feedback=%d threshold=%d → %s",
-        new_feedback, DATA_TRIGGER_COUNT, "FIRE" if data_triggered else "ok",
+        "DATA_TRIGGER: new_feedback=%d threshold=%d -> %s",
+        new_feedback,
+        DATA_TRIGGER_COUNT,
+        "FIRE" if data_triggered else "ok",
     )
 
-    # --- QUALITY TRIGGER ---
-    quality_triggered = False
-    if approval_rate is not None:
-        quality_triggered = approval_rate < QUALITY_THRESHOLD
+    quality_triggered = approval_rate is not None and approval_rate < QUALITY_THRESHOLD
     log.info(
-        "QUALITY_TRIGGER: approval_rate=%s threshold=%.2f → %s",
-        approval_rate, QUALITY_THRESHOLD, "FIRE" if quality_triggered else "ok",
+        "QUALITY_TRIGGER: approval_rate=%s threshold=%.2f -> %s",
+        approval_rate,
+        QUALITY_THRESHOLD,
+        "FIRE" if quality_triggered else "ok",
     )
 
-    # --- DRIFT TRIGGER (proxy: MLflow production F1 drop) ---
-    prod_f1 = _get_production_model_f1(MLFLOW_URI)
-    drift_triggered = False
-    if prod_f1 is not None:
-        drift_triggered = prod_f1 < DRIFT_THRESHOLD
+    baseline_key, drift_baseline = _load_latest_drift_baseline(s3)
+    recent_feature_logs = _load_recent_feature_logs(s3, since)
+    drift_eval = _evaluate_drift(drift_baseline, recent_feature_logs)
+    drift_triggered = drift_eval["triggered"]
     log.info(
-        "DRIFT_TRIGGER: prod_f1=%s threshold=%.2f → %s",
-        prod_f1, DRIFT_THRESHOLD, "FIRE" if drift_triggered else "ok",
+        "DRIFT_TRIGGER: score=%s samples=%d threshold=%.2f -> %s",
+        drift_eval.get("overall_score"),
+        drift_eval.get("sample_count", 0),
+        DRIFT_THRESHOLD,
+        "FIRE" if drift_triggered else "ok",
     )
+    if drift_eval.get("feature_scores"):
+        log.info("Drift feature scores: %s", drift_eval["feature_scores"])
 
-    # --- Decision ---
-    fires = {
-        "data":    data_triggered,
-        "quality": quality_triggered,
-        "drift":   drift_triggered,
+    drift_eval_record = {
+        "evaluated_at": now.isoformat(),
+        "lookback_days": LOOKBACK_DAYS,
+        "baseline_key": baseline_key,
+        "threshold": DRIFT_THRESHOLD,
+        **drift_eval,
     }
-    should_retrain = any(fires.values())
+    drift_eval_key = f"drift/evaluations/{now.strftime('%Y-%m-%d')}/drift_{int(now.timestamp())}.json"
+    if not DRY_RUN:
+        _write_json(s3, drift_eval_key, drift_eval_record)
+        log.info("Drift evaluation written: %s", drift_eval_key)
 
-    if not should_retrain:
-        log.info("No trigger conditions met — no retrain needed.")
+    fires = {
+        "data": data_triggered,
+        "quality": quality_triggered,
+        "drift": drift_triggered,
+    }
+    if not any(fires.values()):
+        log.info("No trigger conditions met -> no retrain needed.")
         sys.exit(0)
 
-    reasons = [k for k, v in fires.items() if v]
+    reasons = [key for key, value in fires.items() if value]
     log.info("RETRAIN TRIGGERED by: %s", reasons)
 
     trigger_record = {
         "triggered_at": now.isoformat(),
         "reasons": reasons,
         "metrics": {
-            "new_feedback_count":  new_feedback,
-            "approval_rate":       approval_rate,
-            "production_f1":       prod_f1,
+            "new_feedback_count": new_feedback,
+            "approval_rate": approval_rate,
+            "drift_score": drift_eval.get("overall_score"),
+            "drift_sample_count": drift_eval.get("sample_count"),
+            "drift_features": drift_eval.get("features_over_threshold"),
+            "drift_baseline_key": baseline_key,
         },
         "thresholds": {
             "data_trigger_count": DATA_TRIGGER_COUNT,
-            "quality_threshold":  QUALITY_THRESHOLD,
-            "drift_threshold":    DRIFT_THRESHOLD,
+            "quality_threshold": QUALITY_THRESHOLD,
+            "drift_threshold": DRIFT_THRESHOLD,
+            "drift_min_samples": DRIFT_MIN_SAMPLES,
         },
+        "drift_evaluation_key": drift_eval_key,
         "processed": False,
     }
 
-    ts = int(now.timestamp())
-    trigger_key = f"triggers/{now.strftime('%Y-%m-%d')}/trigger_{ts}.json"
-
+    trigger_key = f"triggers/{now.strftime('%Y-%m-%d')}/trigger_{int(now.timestamp())}.json"
     if DRY_RUN:
-        log.info("DRY_RUN — would write: %s\n%s", trigger_key, json.dumps(trigger_record, indent=2))
+        log.info("DRY_RUN -> would write: %s\n%s", trigger_key, json.dumps(trigger_record, indent=2))
         sys.exit(0)
 
     _write_json(s3, trigger_key, trigger_record)
     log.info("Trigger record written: %s", trigger_key)
-
-    # Update watermark so next run starts counting from now
-    _save_watermark(s3, {
-        "last_retrain_at": now.isoformat(),
-        "feedback_count_at_retrain": recent_feedback,
-    })
-
-    log.info("Exiting with code %d so CI can detect this trigger.", TRIGGER_EXIT_CODE)
-    sys.exit(TRIGGER_EXIT_CODE)
+    _save_watermark(
+        s3,
+        {
+            "last_retrain_at": now.isoformat(),
+            "feedback_count_at_retrain": recent_feedback,
+        },
+    )
+    log.info("Retrain trigger persisted successfully.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

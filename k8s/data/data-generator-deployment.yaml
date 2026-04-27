@@ -21,8 +21,6 @@ spec:
         app: data-generator
         role: data
     spec:
-      imagePullSecrets:
-        - name: ghcr-pull
       containers:
         - name: generator
           image: ghcr.io/allusudharshanrao/mlops-data-generator:latest

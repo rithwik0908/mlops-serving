@@ -13,9 +13,9 @@ spec:
   tls:
     - secretName: chameleon-nip-tls
       hosts:
-        - mlflow.129.114.27.192.nip.io
+        - mlflow.FLOATING_IP_PLACEHOLDER.nip.io
   rules:
-    - host: mlflow.129.114.27.192.nip.io
+    - host: mlflow.FLOATING_IP_PLACEHOLDER.nip.io
       http:
         paths:
           - path: /

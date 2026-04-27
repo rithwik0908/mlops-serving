@@ -1,4 +1,4 @@
-# ClusterIP — traffic from Traefik Ingress only (no NodePort in default overlay).
+# NodePort added so cross-node pods (worker, hostNetwork) can reach MLflow via host IP.
 ---
 apiVersion: v1
 kind: Service
@@ -8,10 +8,11 @@ metadata:
   labels:
     app: mlflow
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: mlflow
   ports:
     - name: http
       port: 5000
       targetPort: http
+      nodePort: 30500

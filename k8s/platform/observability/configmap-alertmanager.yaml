@@ -1,5 +1,6 @@
-# Default receiver posts JSON to a public echo endpoint so firing alerts succeed without extra setup.
-# For Slack/Discord/PagerDuty: edit this URL or patch the ConfigMap after apply.
+# Default receiver can send email when SMTP values are injected during deployment.
+# The repo keeps placeholders only; deploy_platform.yml replaces them on the VM from environment variables.
+# The webhook fallback remains so the route still works even if SMTP is not configured.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -12,6 +13,11 @@ data:
   alertmanager.yml: |
     global:
       resolve_timeout: 5m
+      smtp_smarthost: 'ALERT_EMAIL_SMARTHOST'
+      smtp_from: 'ALERT_EMAIL_FROM'
+      smtp_auth_username: 'ALERT_EMAIL_AUTH_USERNAME'
+      smtp_auth_password: 'ALERT_EMAIL_AUTH_PASSWORD'
+      smtp_require_tls: true
     route:
       receiver: default
       group_wait: 30s
@@ -19,6 +25,9 @@ data:
       repeat_interval: 4h
     receivers:
       - name: default
+        email_configs:
+          - to: "ALERT_EMAIL_TO"
+            send_resolved: true
         webhook_configs:
           - url: "https://httpbin.org/post"
             send_resolved: true

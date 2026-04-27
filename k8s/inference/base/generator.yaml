@@ -24,10 +24,15 @@ spec:
     spec:
       imagePullSecrets:
         - name: ghcr-pull
+      volumes:
+        - name: tone-generator-code
+          configMap:
+            name: tone-generator-code
+            defaultMode: 0444
       containers:
         - name: tone-generator
           image: ghcr.io/allusudharshanrao/mlops-serving-generator:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8010
               name: http
@@ -40,12 +45,22 @@ spec:
               value: "google/flan-t5-base"
             - name: PEFT_MODEL_PATH
               value: ""
+            - name: GENERATOR_MODEL_URI
+              value: ""
             - name: CLASSIFIER_URL
               value: "http://classifier-pytorch:8001"
             - name: LATENCY_BUDGET_MS
               value: "600"
+            - name: GENERATOR_MAX_CONCURRENT
+              value: "1"
+            - name: GENERATOR_MAX_QUEUE_WAIT_MS
+              value: "250"
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.ml-platform.svc.cluster.local:5000"
+            - name: MLFLOW_ARTIFACT_PATH
+              value: "lora_checkpoint"
+            - name: MLFLOW_DOWNLOAD_DIR
+              value: "/tmp/mlflow_artifacts"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -62,18 +77,27 @@ spec:
               value: "us-east-1"
             - name: AWS_S3_FORCE_PATH_STYLE
               value: "true"
+          volumeMounts:
+            - name: tone-generator-code
+              mountPath: /app/model.py
+              subPath: model.py
+              readOnly: true
+          # /ready stays 503 until the generator thread finishes MLflow download + HF model load.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
-            initialDelaySeconds: 60
-            periodSeconds: 15
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 90
-            periodSeconds: 30
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # Tuned for single-node ~32Gi clusters: low requests improve scheduling;
             # limits still allow Flan-T5 / short bursts (watch OOM if DUMMY_MODE=false + large models).

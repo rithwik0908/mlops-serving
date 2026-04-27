@@ -1,15 +1,3 @@
-# Generator Fine-Tuning Job — instruction-tunes LLM for tone-conditioned rewriting.
-# Owned by: Data / Training Engineer role.
-# Dockerfile: teammate repo (see k8s/containers-matrix.md)
-# Namespace: ml-training  (provisioned in k8s/base/namespaces.yaml)
-#
-# Kubernetes Job (run-to-completion). Heavier than classifier training;
-# GPU strongly recommended for reasonable wall-clock time.
-# Current manifest runs CPU-only (KVM@TACC node has no GPU).
-# GPU path: uncomment nvidia.com/gpu block + runtimeClassName.
-#
-# Apply: kubectl apply -f k8s/training/generator-training-job.yaml
-# Monitor: kubectl logs -n ml-training -l job-name=generator-training -f
 ---
 apiVersion: batch/v1
 kind: Job
@@ -21,8 +9,8 @@ metadata:
     role: training
     model: llm-generator
 spec:
-  backoffLimit: 1
-  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 21600
   template:
     metadata:
       labels:
@@ -31,9 +19,6 @@ spec:
         model: llm-generator
     spec:
       restartPolicy: OnFailure
-      # runtimeClassName: nvidia   # Uncomment for GPU node
-      imagePullSecrets:
-        - name: ghcr-pull
       initContainers:
         - name: pull-datasets
           image: minio/mc:RELEASE.2025-02-21T16-00-46Z
@@ -58,9 +43,21 @@ spec:
             - -c
             - |
               set -eu
-              mc alias set platform "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+              TRIES=0
+              MAX=24
+              until mc alias set platform "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/dev/null 2>&1; do
+                TRIES=$((TRIES+1))
+                if [ "$TRIES" -ge "$MAX" ]; then
+                  echo "ERROR: MinIO not reachable after $((MAX*5))s"
+                  exit 1
+                fi
+                echo "MinIO not ready ($TRIES/$MAX), sleeping 5s..."
+                sleep 5
+              done
               mc ls "platform/$MINIO_BUCKET" >/dev/null
-              mc cp --recursive "platform/$MINIO_BUCKET/datasets/" /data/ || true
+              mkdir -p /data/raw /data/batch
+              mc cp --recursive "platform/$MINIO_BUCKET/raw/" /data/raw/ || true
+              mc cp --recursive "platform/$MINIO_BUCKET/batch/" /data/batch/ || true
           volumeMounts:
             - name: training-data
               mountPath: /data
@@ -68,11 +65,18 @@ spec:
         - name: generator-training
           image: ghcr.io/allusudharshanrao/mlops-training-generator:latest
           imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+          args:
+            - |
+              python -c "import boto3" >/dev/null 2>&1 || python -m pip install --no-cache-dir boto3
+              exec python /app/train_llm.py --config /app/configs/llm_generator_small.yaml
           env:
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.ml-platform.svc.cluster.local:5000"
             - name: MLFLOW_EXPERIMENT_NAME
-              value: "tone-generator"
+              value: "teamchat_tone_generator_llm"
             - name: MINIO_ENDPOINT
               value: "minio.ml-platform.svc.cluster.local:9000"
             - name: MINIO_BUCKET
@@ -104,7 +108,7 @@ spec:
             - name: AWS_S3_FORCE_PATH_STYLE
               value: "true"
             - name: DEVICE
-              value: "cpu"   # Change to "cuda" for GPU node
+              value: "cpu"
             - name: NUM_EPOCHS
               value: "3"
             - name: BATCH_SIZE
@@ -115,23 +119,12 @@ spec:
             - name: output
               mountPath: /output
           resources:
-            # CPU-only baseline. Swap in GPU block below for Blazar reservation.
             requests:
               cpu: "1"
-              # Low request helps scheduling on 32Gi nodes; limit still allows LLM fine-tune heap spikes.
               memory: "2Gi"
             limits:
               cpu: "4"
               memory: "16Gi"
-            # --- GPU block ---
-            # requests:
-            #   cpu: "4"
-            #   memory: "16Gi"
-            #   nvidia.com/gpu: "1"
-            # limits:
-            #   cpu: "8"
-            #   memory: "32Gi"
-            #   nvidia.com/gpu: "1"
       volumes:
         - name: training-data
           emptyDir: {}

@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANSIBLE_DIR="${SCRIPT_DIR}/ansible"
+PLAYBOOKS_DIR="${ANSIBLE_DIR}/playbooks"
+
+INVENTORY_PATH="${INVENTORY_PATH:-${ANSIBLE_DIR}/inventory.ini}"
+PROJECT_ID_SUFFIX="${PROJECT_ID_SUFFIX:-proj15}"
+ZULIP_CHART_DIR="${ZULIP_CHART_DIR:-/home/cc/docker-zulip/helm/zulip}"
+ZULIP_VALUES_FILE="${ZULIP_VALUES_FILE:-/opt/mlops_project/k8s/zulip/values-chameleon.yaml}"
+ZULIP_SECRET_VALUES_FILE="${ZULIP_SECRET_VALUES_FILE:-/home/cc/values-secret.yaml}"
+
+SKIP_BLOCK_STORAGE=false
+SKIP_PVC_MIGRATION=false
+SKIP_BACKUPS=false
+SKIP_ZULIP=false
+SKIP_ML_WORKLOADS=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./infra/run-ansible [options]
+
+Options:
+  --inventory PATH           Inventory file path
+  --project-suffix VALUE     Project/release suffix for Zulip
+  --zulip-chart-dir PATH     Remote docker-zulip chart directory
+  --zulip-values-file PATH   Remote values-chameleon.yaml path
+  --zulip-secret-file PATH   Remote values-secret.yaml path
+  --skip-block-storage
+  --skip-pvc-migration
+  --skip-backups
+  --skip-zulip
+  --skip-ml-workloads
+  -h, --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --inventory)
+      INVENTORY_PATH="$2"
+      shift 2
+      ;;
+    --project-suffix)
+      PROJECT_ID_SUFFIX="$2"
+      shift 2
+      ;;
+    --zulip-chart-dir)
+      ZULIP_CHART_DIR="$2"
+      shift 2
+      ;;
+    --zulip-values-file)
+      ZULIP_VALUES_FILE="$2"
+      shift 2
+      ;;
+    --zulip-secret-file)
+      ZULIP_SECRET_VALUES_FILE="$2"
+      shift 2
+      ;;
+    --skip-block-storage)
+      SKIP_BLOCK_STORAGE=true
+      shift
+      ;;
+    --skip-pvc-migration)
+      SKIP_PVC_MIGRATION=true
+      shift
+      ;;
+    --skip-backups)
+      SKIP_BACKUPS=true
+      shift
+      ;;
+    --skip-zulip)
+      SKIP_ZULIP=true
+      shift
+      ;;
+    --skip-ml-workloads)
+      SKIP_ML_WORKLOADS=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -f "${INVENTORY_PATH}" ]]; then
+  echo "Inventory file not found: ${INVENTORY_PATH}" >&2
+  exit 1
+fi
+
+if command -v ansible-playbook >/dev/null 2>&1; then
+  ANSIBLE_PLAYBOOK="$(command -v ansible-playbook)"
+elif [[ -x "${ANSIBLE_DIR}/.venv/bin/ansible-playbook" ]]; then
+  ANSIBLE_PLAYBOOK="${ANSIBLE_DIR}/.venv/bin/ansible-playbook"
+else
+  echo "Could not find ansible-playbook. Activate infra/ansible/.venv or install Ansible." >&2
+  exit 1
+fi
+
+BACKUP_ENV_READY=true
+for required_var in CHAMELEON_OBJECTSTORE_BUCKET CHAMELEON_OBJECTSTORE_ACCESS_KEY CHAMELEON_OBJECTSTORE_SECRET_KEY; do
+  if [[ -z "${!required_var:-}" ]]; then
+    BACKUP_ENV_READY=false
+    break
+  fi
+done
+
+TLS_MODE="auto-generate self-signed *.nip.io certificate"
+if [[ -n "${CHAMELEON_TLS_CERT_FILE:-}" && -n "${CHAMELEON_TLS_KEY_FILE:-}" ]]; then
+  TLS_MODE="use custom TLS files from CHAMELEON_TLS_CERT_FILE / CHAMELEON_TLS_KEY_FILE"
+fi
+
+ZULIP_SECRET_MODE="auto-generate ${ZULIP_SECRET_VALUES_FILE} on the remote host if missing"
+if [[ -n "${ZULIP_SECRET_KEY:-}" || -n "${ZULIP_POSTGRES_PASSWORD:-}" || -n "${ZULIP_EMAIL_PASSWORD:-}" ]]; then
+  ZULIP_SECRET_MODE="render ${ZULIP_SECRET_VALUES_FILE} using provided ZULIP_* environment overrides"
+fi
+
+STATIC_SEALED_SECRETS_MODE="skip static sealed secret manifests"
+if [[ "${APPLY_STATIC_SEALED_SECRETS:-false}" == "true" ]]; then
+  STATIC_SEALED_SECRETS_MODE="apply static manifests from k8s/secrets/"
+fi
+
+print_preflight() {
+  echo
+  echo "Ansible bring-up preflight"
+  echo "  Inventory: ${INVENTORY_PATH}"
+  echo "  Project suffix: ${PROJECT_ID_SUFFIX}"
+  echo "  Zulip chart dir: ${ZULIP_CHART_DIR}"
+  echo "  Zulip values file: ${ZULIP_VALUES_FILE}"
+  echo "  Zulip secret file: ${ZULIP_SECRET_VALUES_FILE}"
+  echo "  TLS mode: ${TLS_MODE}"
+  echo "  Runtime secret mode: bootstrap via deploy_sealed_secrets.yml"
+  echo "  Static sealed secrets: ${STATIC_SEALED_SECRETS_MODE}"
+  echo "  Zulip secret values: ${ZULIP_SECRET_MODE}"
+  if [[ "${BACKUP_ENV_READY}" == true ]]; then
+    echo "  Backups: enabled for bucket ${CHAMELEON_OBJECTSTORE_BUCKET}"
+  else
+    echo "  Backups: skipped unless CHAMELEON_OBJECTSTORE_BUCKET / ACCESS_KEY / SECRET_KEY are all set"
+  fi
+  if [[ "${SKIP_BLOCK_STORAGE}" == true ]]; then
+    echo "  Block storage prep: skipped"
+  fi
+  if [[ "${SKIP_PVC_MIGRATION}" == true ]]; then
+    echo "  PVC migration: skipped"
+  fi
+  if [[ "${SKIP_ZULIP}" == true ]]; then
+    echo "  Zulip deployment: skipped"
+  fi
+  if [[ "${SKIP_ML_WORKLOADS}" == true ]]; then
+    echo "  ML workloads: skipped"
+  fi
+}
+
+run_playbook() {
+  local name="$1"
+  shift
+  echo
+  echo "==> ${ANSIBLE_PLAYBOOK} $*"
+  (
+    cd "${ANSIBLE_DIR}"
+    "${ANSIBLE_PLAYBOOK}" "$@"
+  )
+}
+
+echo "Running initial Ansible bring-up from ${ANSIBLE_DIR}"
+print_preflight
+
+run_playbook "k3s_install.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/k3s_install.yml"
+run_playbook "deploy_sealed_secrets.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/deploy_sealed_secrets.yml"
+
+if [[ "${SKIP_BLOCK_STORAGE}" == false ]]; then
+  run_playbook "prepare_block_storage.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/prepare_block_storage.yml"
+else
+  echo "Skipping prepare_block_storage.yml"
+fi
+
+run_playbook "deploy_platform.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/deploy_platform.yml"
+
+if [[ "${SKIP_PVC_MIGRATION}" == false ]]; then
+  run_playbook "migrate_platform_pvcs_to_block.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/migrate_platform_pvcs_to_block.yml"
+else
+  echo "Skipping migrate_platform_pvcs_to_block.yml"
+fi
+
+if [[ "${SKIP_BACKUPS}" == false && "${BACKUP_ENV_READY}" == true ]]; then
+  run_playbook "deploy_backups.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/deploy_backups.yml"
+else
+  echo "Skipping deploy_backups.yml"
+  if [[ "${SKIP_BACKUPS}" == false && "${BACKUP_ENV_READY}" == false ]]; then
+    echo "Reason: CHAMELEON_OBJECTSTORE_BUCKET / ACCESS_KEY / SECRET_KEY are not all set."
+  fi
+fi
+
+if [[ "${SKIP_ZULIP}" == false ]]; then
+  run_playbook "deploy_zulip.yml" \
+    -i "${INVENTORY_PATH}" \
+    "${PLAYBOOKS_DIR}/deploy_zulip.yml" \
+    -e "zulip_chart_dir=${ZULIP_CHART_DIR}" \
+    -e "project_id_suffix=${PROJECT_ID_SUFFIX}" \
+    -e "zulip_values_file=${ZULIP_VALUES_FILE}" \
+    -e "zulip_secret_values_file=${ZULIP_SECRET_VALUES_FILE}"
+else
+  echo "Skipping deploy_zulip.yml"
+fi
+
+if [[ "${SKIP_ML_WORKLOADS}" == false ]]; then
+  run_playbook "deploy_ml_workloads.yml" -i "${INVENTORY_PATH}" "${PLAYBOOKS_DIR}/deploy_ml_workloads.yml"
+else
+  echo "Skipping deploy_ml_workloads.yml"
+fi
+
+echo
+echo "Ansible bring-up completed."

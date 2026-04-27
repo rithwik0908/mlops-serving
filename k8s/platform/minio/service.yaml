@@ -7,13 +7,15 @@ metadata:
   labels:
     app: minio
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: minio
   ports:
     - name: api
       port: 9000
       targetPort: api
+      nodePort: 30900
     - name: console
       port: 9001
       targetPort: console
+      nodePort: 30901

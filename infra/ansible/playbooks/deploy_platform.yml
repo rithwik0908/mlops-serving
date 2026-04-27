@@ -1,29 +1,20 @@
 ---
 # Copies k8s/ to the VM; applies namespaces, MLflow, MinIO, and Prometheus/Grafana (monitoring).
-# Creates Secret minio-root in ml-platform using minio_root_password (see vars below).
-# Creates Secret grafana-admin in monitoring with a random password (retrieve via kubectl).
-# Expects k3s and ~/.kube/config from k3s_install. Repo path on VM: /opt/mlops_project.
-#
-# Run: ansible-playbook -i ../inventory.ini playbooks/deploy_platform.yml
-# Override password without editing this file:
-#   ansible-playbook ... -e minio_root_password=yourpassword
-# Or set MINIO_ROOT_PASSWORD in your shell before running.
-# Playbook order + dedupe policy: ../../ONE_PLATFORM_AND_CLEANUP.md
+# Runtime secrets are expected to come from Sealed Secrets via deploy_sealed_secrets.yml.
 - name: Deploy namespaces + platform services (MLflow, MinIO, observability)
-  hosts: chameleon
+  hosts: control_plane
   become: true
   gather_facts: false
   vars:
     kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
     repo_root: "/opt/mlops_project"
-    # MinIO root credentials — username is fixed; password can be overridden via:
-    #   -e minio_root_password=<value>  OR  env var MINIO_ROOT_PASSWORD
-    # Must match the MINIO_ROOT_PASSWORD set on the running MinIO Pod/deployment.
-    minio_root_user: "minioadmin"
-    minio_root_password: "{{ lookup('env', 'MINIO_ROOT_PASSWORD') | default('minio-password', true) }}"
-    # Grafana admin credentials — override via -e grafana_admin_password=<value>
-    # or env var GRAFANA_ADMIN_PASSWORD. Must match GF_SECURITY_ADMIN_PASSWORD.
-    grafana_admin_password: "{{ lookup('env', 'GRAFANA_ADMIN_PASSWORD') | default('grafana-password', true) }}"
+    public_floating_ip: "{{ hostvars[groups['control_plane'][0]].ansible_host }}"
+    public_nip_base: "{{ lookup('env', 'PUBLIC_NIP_BASE') | default(public_floating_ip ~ '.nip.io', true) }}"
+    alert_email_to: "{{ lookup('env', 'ALERT_EMAIL_TO') | default('', true) }}"
+    alert_email_from: "{{ lookup('env', 'ALERT_EMAIL_FROM') | default('', true) }}"
+    alert_email_smarthost: "{{ lookup('env', 'ALERT_EMAIL_SMARTHOST') | default('', true) }}"
+    alert_email_auth_username: "{{ lookup('env', 'ALERT_EMAIL_AUTH_USERNAME') | default('', true) }}"
+    alert_email_auth_password: "{{ lookup('env', 'ALERT_EMAIL_AUTH_PASSWORD') | default('', true) }}"
   tasks:
     - name: Ensure git is installed
       ansible.builtin.package:
@@ -38,7 +29,7 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
 
-    - name: Copy manifests to VM (expects repo present locally)
+    - name: Copy manifests to VM
       ansible.builtin.copy:
         src: "../../../k8s/"
         dest: "{{ repo_root }}/k8s/"
@@ -46,9 +37,13 @@
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
 
-    # copy does not delete stale files on the VM; old flat inference YAML (wrong images)
-    # would otherwise linger next to k8s/inference/base|overlays|backends/.
-    - name: Remove obsolete flat inference manifests from VM (superseded by kustomize tree)
+    - name: Render shared public nip.io hostnames in synced manifests
+      ansible.builtin.command: >
+        python3 {{ repo_root }}/k8s/scripts/render_public_endpoints.py
+        --root {{ repo_root }}
+        --base {{ public_nip_base }}
+
+    - name: Remove obsolete flat inference manifests from VM
       ansible.builtin.file:
         path: "{{ repo_root }}/k8s/inference/{{ item }}"
         state: absent
@@ -81,37 +76,41 @@
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/platform/mlflow/
 
-    - name: Ensure MinIO root secret exists (ml-platform namespace)
-      ansible.builtin.shell: |
-        set -e
-        # Use --dry-run=client | apply so re-running updates the secret if the password changed.
-        kubectl --kubeconfig {{ kubeconfig_path }} create secret generic minio-root -n ml-platform \
-          --from-literal=root-user={{ minio_root_user }} \
-          --from-literal=root-password={{ minio_root_password }} \
-          --dry-run=client -o yaml | \
-        kubectl --kubeconfig {{ kubeconfig_path }} apply -f -
-      args:
-        executable: /bin/bash
-      no_log: true
+    - name: Verify MinIO root secret exists (ml-platform namespace)
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        get secret minio-root -n ml-platform
 
     - name: Apply MinIO kustomize
       ansible.builtin.command: >
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/platform/minio/
 
-    - name: Ensure Grafana admin secret exists (monitoring namespace)
-      ansible.builtin.shell: |
-        set -e
-        kubectl --kubeconfig {{ kubeconfig_path }} create secret generic grafana-admin -n monitoring \
-          --from-literal=admin-password={{ grafana_admin_password }} \
-          --dry-run=client -o yaml | \
-        kubectl --kubeconfig {{ kubeconfig_path }} apply -f -
-      args:
-        executable: /bin/bash
+    - name: Verify Grafana admin secret exists (monitoring namespace)
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        get secret grafana-admin -n monitoring
+
+    - name: Inject Alertmanager SMTP settings into observability config on VM
+      ansible.builtin.replace:
+        path: "{{ repo_root }}/k8s/platform/observability/configmap-alertmanager.yaml"
+        regexp: "{{ item.placeholder }}"
+        replace: "{{ item.value }}"
+      loop:
+        - { placeholder: "ALERT_EMAIL_TO", value: "{{ alert_email_to | default('', true) }}" }
+        - { placeholder: "ALERT_EMAIL_FROM", value: "{{ alert_email_from | default('', true) }}" }
+        - { placeholder: "ALERT_EMAIL_SMARTHOST", value: "{{ alert_email_smarthost | default('', true) }}" }
+        - { placeholder: "ALERT_EMAIL_AUTH_USERNAME", value: "{{ alert_email_auth_username | default('', true) }}" }
+        - { placeholder: "ALERT_EMAIL_AUTH_PASSWORD", value: "{{ alert_email_auth_password | default('', true) }}" }
+      when:
+        - alert_email_to | length > 0
+        - alert_email_from | length > 0
+        - alert_email_smarthost | length > 0
+        - alert_email_auth_username | length > 0
+        - alert_email_auth_password | length > 0
       no_log: true
 
     - name: Apply Prometheus and Grafana kustomize
       ansible.builtin.command: >
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/platform/observability/
-

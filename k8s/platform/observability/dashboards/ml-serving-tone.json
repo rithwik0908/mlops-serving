@@ -1,5 +1,7 @@
 {
-  "annotations": {"list": []},
+  "annotations": {
+    "list": []
+  },
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -7,16 +9,34 @@
   "liveNow": false,
   "panels": [
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "reqps"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 0},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
@@ -25,20 +45,38 @@
           "refId": "A"
         }
       ],
-      "title": "Classifier — Request Rate (RPS)",
+      "title": "Classifier Request Rate",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "s"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 0},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
       "id": 2,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
@@ -52,50 +90,96 @@
           "refId": "B"
         }
       ],
-      "title": "Classifier — Latency p95 / p50",
+      "title": "Classifier Latency",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 0.01},
-              {"color": "red", "value": 0.05}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
             ]
           },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 0},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
       "id": 3,
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "auto", "textMode": "auto", "colorMode": "background"},
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
       "targets": [
         {
-          "expr": "sum(rate(classifier_requests_total{kubernetes_namespace=\"ml-serving\",status=\"error\"}[5m])) / clamp_min(sum(rate(classifier_requests_total{kubernetes_namespace=\"ml-serving\"}[5m])), 0.001)",
+          "expr": "clamp_min(sum(rate(classifier_requests_total{kubernetes_namespace=\"ml-serving\",status=\"error\"}[5m])) or vector(0), 0) / clamp_min(sum(rate(classifier_requests_total{kubernetes_namespace=\"ml-serving\"}[5m])) or vector(0), 0.001)",
           "legendFormat": "error ratio",
           "refId": "A"
         }
       ],
-      "title": "Classifier — Error Ratio",
+      "title": "Classifier Error Ratio",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "reqps"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 7},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 7
+      },
       "id": 4,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
@@ -104,20 +188,38 @@
           "refId": "A"
         }
       ],
-      "title": "Generator — Request Rate (RPS)",
+      "title": "Generator Request Rate",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "s"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 7},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 7
+      },
       "id": 5,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
@@ -131,122 +233,365 @@
           "refId": "B"
         }
       ],
-      "title": "Generator — Latency p95 / p50",
+      "title": "Generator Latency",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 0.01},
-              {"color": "red", "value": 0.05}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
             ]
           },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 7},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 7
+      },
       "id": 6,
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "auto", "textMode": "auto", "colorMode": "background"},
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
       "targets": [
         {
-          "expr": "sum(rate(generator_requests_total{kubernetes_namespace=\"ml-serving\",status=\"error\"}[5m])) / clamp_min(sum(rate(generator_requests_total{kubernetes_namespace=\"ml-serving\"}[5m])), 0.001)",
+          "expr": "clamp_min(sum(rate(generator_requests_total{kubernetes_namespace=\"ml-serving\",status=\"error\"}[5m])) or vector(0), 0) / clamp_min(sum(rate(generator_requests_total{kubernetes_namespace=\"ml-serving\"}[5m])) or vector(0), 0.001)",
           "legendFormat": "error ratio",
           "refId": "A"
         }
       ],
-      "title": "Generator — Error Ratio",
+      "title": "Generator Error Ratio",
       "type": "stat"
-    }
-  ],
+    },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red",    "value": null},
-              {"color": "yellow", "value": 0.60},
-              {"color": "green",  "value": 0.75}
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.6
+              },
+              {
+                "color": "green",
+                "value": 0.75
+              }
             ]
           },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 14},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
       "id": 7,
-      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "auto", "textMode": "auto", "colorMode": "background"},
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
       "targets": [
         {
-          "expr": "sum(rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\",user_action=~\"thumbs_up|selected\"}[24h])) / clamp_min(sum(rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\"}[24h])), 0.001)",
-          "legendFormat": "approval rate (24h)",
+          "expr": "clamp_min(sum(rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\",user_action=~\"thumbs_up|selected\"}[24h])) or vector(0), 0) / clamp_min(sum(rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\"}[24h])) or vector(0), 0.001)",
+          "legendFormat": "approval rate",
           "refId": "A"
         }
       ],
-      "title": "Feedback — Approval Rate (24h)",
+      "title": "Feedback Approval Rate",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "short"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 14},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
       "id": 8,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
-          "expr": "sum by (user_action) (rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\"}[5m]))",
+          "expr": "sum by (user_action) (rate(bridge_feedback_total{kubernetes_namespace=\"ml-serving\"}[5m])) or label_replace(vector(0), \"user_action\", \"none\", \"\", \"\")",
           "legendFormat": "{{user_action}}",
           "refId": "A"
         }
       ],
-      "title": "Feedback — Signals by Type (RPS)",
+      "title": "Feedback Signals",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "unit": "short"},
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
         "overrides": []
       },
-      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 14},
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      },
       "id": 9,
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
-          "expr": "sum by (tone_shown) (increase(bridge_feedback_total{kubernetes_namespace=\"ml-serving\",user_action=\"thumbs_down\"}[24h]))",
-          "legendFormat": "thumbs_down on {{tone_shown}}",
+          "expr": "sum by (tone_shown) (increase(bridge_feedback_total{kubernetes_namespace=\"ml-serving\",user_action=\"thumbs_down\"}[24h])) or label_replace(vector(0), \"tone_shown\", \"none\", \"\", \"\")",
+          "legendFormat": "{{tone_shown}}",
           "refId": "A"
         }
       ],
-      "title": "Feedback — Thumbs-down by Tone (24h)",
+      "title": "Thumbs Down by Tone",
       "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.15
+              },
+              {
+                "color": "red",
+                "value": 0.25
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 21
+      },
+      "id": 10,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "clamp_min(sum(rate(generator_variant_source_total{kubernetes_namespace=\"ml-serving\",source=\"fallback\"}[15m])) or vector(0), 0) / clamp_min(sum(rate(generator_variant_source_total{kubernetes_namespace=\"ml-serving\"}[15m])) or vector(0), 0.001)",
+          "legendFormat": "fallback ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "Generator Fallback Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 21
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(generator_request_path_total{kubernetes_namespace=\"ml-serving\"}[5m])) or label_replace(vector(0), \"path\", \"none\", \"\", \"\")",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Generator Request Path Mix",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 21
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(generator_queue_wait_seconds_bucket{kubernetes_namespace=\"ml-serving\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(generator_queue_wait_seconds_bucket{kubernetes_namespace=\"ml-serving\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "title": "Generator Queue Wait",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["mlops", "ml-serving", "serving"],
-  "templating": {"list": []},
-  "time": {"from": "now-6h", "to": "now"},
+  "tags": [
+    "mlops",
+    "ml-serving",
+    "serving"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "timezone": "browser",
-  "title": "ML Serving — Classifier, Generator & Feedback",
+  "title": "ML Serving Health",
   "uid": "ml-serving-tone",
-  "version": 3
+  "version": 6
 }

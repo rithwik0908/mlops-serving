@@ -1,0 +1,103 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prometheus-snapshot-backup
+  namespace: monitoring
+  labels:
+    app: backup
+    component: prometheus
+spec:
+  schedule: "45 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: backup
+            component: prometheus
+        spec:
+          nodeSelector:
+            mlops.storage: block
+          restartPolicy: Never
+          volumes:
+            - name: prometheus-data
+              persistentVolumeClaim:
+                claimName: prometheus-data
+            - name: backup-scripts
+              configMap:
+                name: backup-scripts
+                defaultMode: 0555
+          containers:
+            - name: prometheus-backup
+              image: python:3.12-alpine
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  apk add --no-cache curl tar gzip >/dev/null
+                  python -m pip install --no-cache-dir boto3 >/dev/null
+                  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                  export SNAPSHOT_JSON="$(curl -sf -XPOST 'http://prometheus.monitoring.svc.cluster.local:9090/api/v1/admin/tsdb/snapshot?skip_head=true')"
+                  SNAPSHOT_NAME="$(python - <<'PY'
+                  import json
+                  import os
+                  payload = json.loads(os.environ["SNAPSHOT_JSON"])
+                  print(payload["data"]["name"])
+                  PY
+                  )"
+                  OUT="/tmp/prometheus-${TS}.tar.gz"
+                  tar -C /prometheus/snapshots -czf "${OUT}" "${SNAPSHOT_NAME}"
+                  python /scripts/upload_file.py "${OUT}" "monitoring/prometheus/${TS}.tar.gz"
+                  rm -rf "/prometheus/snapshots/${SNAPSHOT_NAME}"
+              env:
+                - name: OBJECTSTORE_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: endpoint
+                - name: OBJECTSTORE_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: bucket
+                - name: OBJECTSTORE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: prefix
+                - name: OBJECTSTORE_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: access-key
+                - name: OBJECTSTORE_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: secret-key
+                - name: OBJECTSTORE_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: chameleon-objectstore-backup
+                      key: region
+              volumeMounts:
+                - name: prometheus-data
+                  mountPath: /prometheus
+                - name: backup-scripts
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: 256Mi
+                limits:
+                  cpu: "500m"
+                  memory: 512Mi

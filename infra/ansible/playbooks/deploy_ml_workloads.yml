@@ -1,32 +1,17 @@
 ---
-# Apply data / inference / integration (Zulip bridge) / training Kustomize bundles on the Chameleon VM.
-# Prerequisites: deploy_platform (namespaces, MinIO in ml-platform), k8s/ synced to /opt/mlops_project.
-# Copies minio-root into ml-data / ml-training / ml-serving for secretKeyRef (S3 + MLflow artifacts).
-# After inference + bridge, applies k8s/training/register-bundle/ (ConfigMap + Job). Job templates are immutable:
-# by default the Job is deleted first so apply succeeds (REPLACE_REGISTER_JOB=false to skip delete — apply may fail if the template changed).
-# Does not modify application source under data/, serving/, or training_proj15-main/.
-#
-# Run from WSL (venv): ansible-playbook -i inventory.ini playbooks/deploy_ml_workloads.yml
-# After deploy_platform.yml (shared MinIO/MLflow). Policy: ../../ONE_PLATFORM_AND_CLEANUP.md
-#
-# Training Jobs (classifier + generator) rerun at end — can take hours. To sync/apply only:
-#   RUN_TRAINING_JOBS=false ansible-playbook ...   or   -e run_training_jobs=false
-#
-# GHCR images:
-# - If pulls fail with "not found", the package likely lives under a different GHCR owner.
-#   Export GHCR_IMAGE_OWNER (lowercase GitHub user/org) before running this playbook.
-# - For private packages, also export GHCR_USERNAME + GHCR_TOKEN (classic PAT: read:packages).
-#
-# Data ingest/batch Jobs:
-# - Set RUN_DATA_INGEST_JOBS=false (or -e run_data_ingest_jobs=false) to skip one-shot ingest/batch
-#   while still applying data-online/data-generator + minio-bucket-init.
+# Apply data / inference / integration / training bundles on the Chameleon control-plane.
 - name: Deploy ML data, serving, and training manifests
-  hosts: chameleon
+  hosts: control_plane
   become: true
   gather_facts: false
   vars:
     kubeconfig_path: "/home/{{ ansible_user }}/.kube/config"
     repo_root: "/opt/mlops_project"
+    public_floating_ip: "{{ hostvars[groups['control_plane'][0]].ansible_host }}"
+    public_nip_base: "{{ lookup('env', 'PUBLIC_NIP_BASE') | default(public_floating_ip ~ '.nip.io', true) }}"
+    training_endpoint_files:
+      - "k8s/training/classifier-training-job.yaml"
+      - "k8s/training/generator-training-job.yaml"
     ghcr_server: "ghcr.io"
     ghcr_secret_name: "ghcr-pull"
     ghcr_username: "{{ lookup('env', 'GHCR_USERNAME') | default('', true) }}"
@@ -38,9 +23,10 @@
     run_data_ingest_jobs: "{{ run_data_ingest_jobs_raw | lower in ['1', 'true', 'yes', 'y'] }}"
     run_training_jobs_raw: "{{ lookup('env', 'RUN_TRAINING_JOBS') | default('true', true) }}"
     run_training_jobs: "{{ run_training_jobs_raw | lower in ['1', 'true', 'yes', 'y'] }}"
-    # Job.spec.template is immutable — delete first so manifest updates apply (may re-run register; new MLflow versions).
     replace_register_job_raw: "{{ lookup('env', 'REPLACE_REGISTER_JOB') | default('true', true) }}"
     replace_register_job: "{{ replace_register_job_raw | lower in ['1', 'true', 'yes', 'y'] }}"
+    wait_minio_bucket_init_raw: "{{ lookup('env', 'WAIT_MINIO_BUCKET_INIT') | default('true', true) }}"
+    wait_minio_bucket_init: "{{ wait_minio_bucket_init_raw | lower in ['1', 'true', 'yes', 'y'] }}"
   tasks:
     - name: Sync k8s manifests to VM
       ansible.builtin.copy:
@@ -59,59 +45,32 @@
           echo "GHCR owner rewrite skipped (already $to)"
           exit 0
         fi
-        echo "Rewriting image prefix: $from -> $to"
         find "{{ repo_root }}/k8s" \( -name '*.yaml' -o -name '*.yml' \) -print0 \
           | xargs -0 -r sed -i "s|${from}|${to}|g"
       args:
         executable: /bin/bash
 
-    - name: Replicate minio-root Secret into ml-data namespace
-      ansible.builtin.shell: |
-        set -euo pipefail
-        kubectl --kubeconfig "{{ kubeconfig_path }}" get secret minio-root -n ml-platform -o json | python3 -c "
-        import json, sys
-        d = json.load(sys.stdin)
-        m = d['metadata']
-        for k in ('uid', 'resourceVersion', 'creationTimestamp', 'managedFields'):
-            m.pop(k, None)
-        m['namespace'] = 'ml-data'
-        d.pop('status', None)
-        print(json.dumps(d))
-        " | kubectl --kubeconfig "{{ kubeconfig_path }}" apply -f -
-      args:
-        executable: /bin/bash
+    - name: Render shared public nip.io hostnames in synced manifests
+      ansible.builtin.command: >
+        python3 {{ repo_root }}/k8s/scripts/render_public_endpoints.py
+        --root {{ repo_root }}
+        --base {{ public_nip_base }}
 
-    - name: Replicate minio-root Secret into ml-training namespace
-      ansible.builtin.shell: |
-        set -euo pipefail
-        kubectl --kubeconfig "{{ kubeconfig_path }}" get secret minio-root -n ml-platform -o json | python3 -c "
-        import json, sys
-        d = json.load(sys.stdin)
-        m = d['metadata']
-        for k in ('uid', 'resourceVersion', 'creationTimestamp', 'managedFields'):
-            m.pop(k, None)
-        m['namespace'] = 'ml-training'
-        d.pop('status', None)
-        print(json.dumps(d))
-        " | kubectl --kubeconfig "{{ kubeconfig_path }}" apply -f -
-      args:
-        executable: /bin/bash
+    - name: Update training endpoint IPs to the current floating IP
+      ansible.builtin.replace:
+        path: "{{ repo_root }}/{{ item }}"
+        regexp: "\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b"
+        replace: "{{ public_floating_ip }}"
+      loop: "{{ training_endpoint_files }}"
 
-    - name: Replicate minio-root Secret into ml-serving namespace
-      ansible.builtin.shell: |
-        set -euo pipefail
-        kubectl --kubeconfig "{{ kubeconfig_path }}" get secret minio-root -n ml-platform -o json | python3 -c "
-        import json, sys
-        d = json.load(sys.stdin)
-        m = d['metadata']
-        for k in ('uid', 'resourceVersion', 'creationTimestamp', 'managedFields'):
-            m.pop(k, None)
-        m['namespace'] = 'ml-serving'
-        d.pop('status', None)
-        print(json.dumps(d))
-        " | kubectl --kubeconfig "{{ kubeconfig_path }}" apply -f -
-      args:
-        executable: /bin/bash
+    - name: Verify minio-root Secret exists in workload namespaces
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        get secret minio-root -n {{ item }}
+      loop:
+        - ml-data
+        - ml-training
+        - ml-serving
 
     - name: Create/update GHCR image pull secret in workload namespaces
       ansible.builtin.shell: |
@@ -138,20 +97,20 @@
         executable: /bin/bash
       when: run_data_ingest_jobs | bool
 
-    - name: Delete MinIO bucket init job before full data kustomize (fresh Job; avoids stuck Running)
+    - name: Delete MinIO bucket init job before full data kustomize
       ansible.builtin.shell: |
         kubectl --kubeconfig "{{ kubeconfig_path }}" delete job -n ml-data minio-bucket-init --ignore-not-found
       args:
         executable: /bin/bash
       when: run_data_ingest_jobs | bool
 
-    - name: Apply data stack (ml-data) — full bundle (includes ingest/batch Jobs)
+    - name: Apply data stack (ml-data) full bundle
       ansible.builtin.command: >
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/data/
       when: run_data_ingest_jobs | bool
 
-    - name: Apply data stack (ml-data) — without ingest/batch Jobs
+    - name: Apply data stack (ml-data) without ingest/batch Jobs
       ansible.builtin.shell: |
         set -euo pipefail
         kubectl --kubeconfig "{{ kubeconfig_path }}" apply -f "{{ repo_root }}/k8s/data/data-online-service.yaml"
@@ -172,6 +131,12 @@
         kubectl --kubeconfig "{{ kubeconfig_path }}" wait --for=condition=complete job/minio-bucket-init -n ml-data --timeout=600s
       args:
         executable: /bin/bash
+      when: (run_data_ingest_jobs | bool) and (wait_minio_bucket_init | bool)
+
+    - name: Skipped MinIO bucket init wait
+      ansible.builtin.debug:
+        msg: "WAIT_MINIO_BUCKET_INIT=false (or light data path): not waiting on job/minio-bucket-init."
+      when: (run_data_ingest_jobs | bool) and not (wait_minio_bucket_init | bool)
 
     - name: Re-run data ingest + batch jobs (ml-data)
       ansible.builtin.shell: |
@@ -191,20 +156,30 @@
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/inference/
 
+    - name: Wait for inference deployments to become ready (ml-serving)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for deploy in \
+          classifier-pytorch-staging \
+          classifier-pytorch-canary \
+          classifier-pytorch-prod \
+          tone-generator-staging \
+          tone-generator-canary \
+          tone-generator-prod; do
+          kubectl --kubeconfig "{{ kubeconfig_path }}" rollout status deployment/"$deploy" -n ml-serving --timeout=900s
+        done
+      args:
+        executable: /bin/bash
+
     - name: Apply Zulip bridge (ml-serving)
       ansible.builtin.command: >
         kubectl --kubeconfig {{ kubeconfig_path }}
         apply -k {{ repo_root }}/k8s/integration/
 
-    - name: Apply MLflow register bundle (ConfigMap + Job in ml-training)
-      ansible.builtin.shell: |
-        set -euo pipefail
-        {% if replace_register_job | bool %}
-        kubectl --kubeconfig "{{ kubeconfig_path }}" delete job -n ml-training register-and-alias-latest --ignore-not-found
-        {% endif %}
-        kubectl --kubeconfig "{{ kubeconfig_path }}" apply -k "{{ repo_root }}/k8s/training/register-bundle/"
-      args:
-        executable: /bin/bash
+    - name: Wait for Zulip bridge deployment to become ready (ml-serving)
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        rollout status deployment/zulip-bridge -n ml-serving --timeout=600s
 
     - name: Re-run training jobs (ml-training)
       ansible.builtin.shell: |
@@ -216,4 +191,20 @@
         kubectl --kubeconfig "{{ kubeconfig_path }}" wait --for=condition=complete job/generator-training -n ml-training --timeout=7200s
       args:
         executable: /bin/bash
+      when: run_training_jobs | bool
+
+    - name: Apply MLflow register bundle (ConfigMap + Job in ml-training)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {% if replace_register_job | bool %}
+        kubectl --kubeconfig "{{ kubeconfig_path }}" delete job -n ml-training register-and-alias-latest --ignore-not-found
+        {% endif %}
+        kubectl --kubeconfig "{{ kubeconfig_path }}" apply -k "{{ repo_root }}/k8s/training/register-bundle/"
+      args:
+        executable: /bin/bash
+
+    - name: Wait for register-and-alias-latest job to complete (ml-training)
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }}
+        wait --for=condition=complete job/register-and-alias-latest -n ml-training --timeout=1800s
       when: run_training_jobs | bool
